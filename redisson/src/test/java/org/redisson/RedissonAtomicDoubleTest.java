@@ -1,14 +1,37 @@
 package org.redisson;
 
-import static org.assertj.core.api.Assertions.assertThat;
+import org.junit.jupiter.api.Test;
+import org.redisson.api.RAtomicDouble;
 
 import java.math.BigDecimal;
 
-import org.junit.Test;
-import org.redisson.api.RAtomicDouble;
+import static org.assertj.core.api.Assertions.assertThat;
 
-public class RedissonAtomicDoubleTest extends BaseTest {
+public class RedissonAtomicDoubleTest extends RedisDockerTest {
 
+    @Test
+    public void testGetAndSet() {
+        RAtomicDouble al = redisson.getAtomicDouble("test");
+        assertThat(al.getAndSet(12)).isEqualTo(0);
+    }
+
+    @Test
+    public void testGetZero() {
+        RAtomicDouble ad2 = redisson.getAtomicDouble("test");
+        assertThat(ad2.get()).isZero();
+    }
+    
+    @Test
+    public void testGetAndDelete() {
+        RAtomicDouble al = redisson.getAtomicDouble("test");
+        al.set(10.34);
+        assertThat(al.getAndDelete()).isEqualTo(10.34);
+        assertThat(al.isExists()).isFalse();
+
+        RAtomicDouble ad2 = redisson.getAtomicDouble("test2");
+        assertThat(ad2.getAndDelete()).isZero();
+    }
+    
     @Test
     public void testCompareAndSet() {
         RAtomicDouble al = redisson.getAtomicDouble("test");
@@ -27,6 +50,14 @@ public class RedissonAtomicDoubleTest extends BaseTest {
         assertThat(al.get()).isEqualTo(3.81);
     }
 
+    @Test
+    public void testDecrementAndGet() {
+        RAtomicDouble al = redisson.getAtomicDouble("test");
+        al.set(19.30);
+        assertThat(al.decrementAndGet()).isEqualTo(18.30);
+        assertThat(al.get()).isEqualTo(18.30);
+    }
+    
     @Test
     public void testIncrementAndGet() {
         RAtomicDouble al = redisson.getAtomicDouble("test");

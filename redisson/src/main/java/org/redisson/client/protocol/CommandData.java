@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,13 +15,15 @@
  */
 package org.redisson.client.protocol;
 
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-
 import org.redisson.client.codec.Codec;
 import org.redisson.client.protocol.decoder.MultiDecoder;
-import org.redisson.misc.RPromise;
+import org.redisson.misc.LogHelper;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /**
  * 
@@ -32,17 +34,17 @@ import org.redisson.misc.RPromise;
  */
 public class CommandData<T, R> implements QueueCommand {
 
-    final RPromise<R> promise;
-    final RedisCommand<T> command;
+    final CompletableFuture<R> promise;
+    RedisCommand<T> command;
     final Object[] params;
     final Codec codec;
     final MultiDecoder<Object> messageDecoder;
 
-    public CommandData(RPromise<R> promise, Codec codec, RedisCommand<T> command, Object[] params) {
+    public CommandData(CompletableFuture<R> promise, Codec codec, RedisCommand<T> command, Object[] params) {
         this(promise, null, codec, command, params);
     }
 
-    public CommandData(RPromise<R> promise, MultiDecoder<Object> messageDecoder, Codec codec, RedisCommand<T> command, Object[] params) {
+    public CommandData(CompletableFuture<R> promise, MultiDecoder<Object> messageDecoder, Codec codec, RedisCommand<T> command, Object[] params) {
         this.promise = promise;
         this.command = command;
         this.params = params;
@@ -62,20 +64,27 @@ public class CommandData<T, R> implements QueueCommand {
         return messageDecoder;
     }
 
-    public RPromise<R> getPromise() {
+    public CompletableFuture<R> getPromise() {
         return promise;
     }
     
     public Throwable cause() {
-        return promise.cause();
+        try {
+            promise.getNow(null);
+            return null;
+        } catch (CompletionException e) {
+            return e.getCause();
+        } catch (CancellationException e) {
+            return e;
+        }
     }
 
     public boolean isSuccess() {
-        return promise.isSuccess();
+        return promise.isDone() && !promise.isCompletedExceptionally();
     }
 
     public boolean tryFailure(Throwable cause) {
-        return promise.tryFailure(cause);
+        return promise.completeExceptionally(cause);
     }
 
     public Codec getCodec() {
@@ -84,20 +93,24 @@ public class CommandData<T, R> implements QueueCommand {
 
     @Override
     public String toString() {
-        return "CommandData [promise=" + promise + ", command=" + command + ", params="
-                + Arrays.toString(params) + ", codec=" + codec + "]";
+        return "CommandData [command=" + LogHelper.toString(this) + ", codec=" + codec + "]";
     }
 
     @Override
     public List<CommandData<Object, Object>> getPubSubOperations() {
-        if (PUBSUB_COMMANDS.contains(getCommand().getName())) {
-            return Collections.singletonList((CommandData<Object, Object>)this);
+        if (RedisCommands.PUBSUB_COMMANDS.contains(getCommand().getName())) {
+            return Collections.singletonList((CommandData<Object, Object>) this);
         }
         return Collections.emptyList();
     }
     
     public boolean isBlockingCommand() {
-        return QueueCommand.TIMEOUTLESS_COMMANDS.contains(command.getName()) && !promise.isDone();
+        return command.isBlockingCommand();
+    }
+
+    @Override
+    public boolean isExecuted() {
+        return promise.isDone();
     }
 
 }

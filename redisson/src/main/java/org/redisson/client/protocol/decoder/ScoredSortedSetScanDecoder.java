@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,23 +15,25 @@
  */
 package org.redisson.client.protocol.decoder;
 
-import java.math.BigDecimal;
-
+import org.redisson.client.codec.Codec;
+import org.redisson.client.codec.DoubleCodec;
 import org.redisson.client.handler.State;
+import org.redisson.client.protocol.Decoder;
 
-import io.netty.buffer.ByteBuf;
-import io.netty.util.CharsetUtil;
-
+/**
+ * 
+ * @author Nikita Koksharov
+ *
+ * @param <T> type
+ */
 public class ScoredSortedSetScanDecoder<T> extends ObjectListReplayDecoder<T> {
 
     @Override
-    public Object decode(ByteBuf buf, State state) {
-        return new BigDecimal(buf.toString(CharsetUtil.UTF_8));
+    public Decoder<Object> getDecoder(Codec codec, int paramNum, State state, long size) {
+        if (paramNum % 2 != 0) {
+            return DoubleCodec.INSTANCE.getValueDecoder();
+        }
+        return super.getDecoder(codec, paramNum, state, size);
     }
-
-    @Override
-    public boolean isApplicable(int paramNum, State state) {
-        return paramNum % 2 != 0;
-    }
-
+    
 }

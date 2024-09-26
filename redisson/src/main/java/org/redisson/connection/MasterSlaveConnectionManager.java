@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,63 +15,25 @@
  */
 package org.redisson.connection;
 
-import java.net.InetSocketAddress;
-import java.net.URI;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Queue;
-import java.util.Set;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-
-import org.redisson.Version;
+import io.netty.buffer.ByteBuf;
 import org.redisson.api.NodeType;
-import org.redisson.api.RFuture;
-import org.redisson.client.BaseRedisPubSubListener;
-import org.redisson.client.RedisClient;
-import org.redisson.client.RedisConnection;
-import org.redisson.client.RedisNodeNotFoundException;
-import org.redisson.client.RedisPubSubConnection;
-import org.redisson.client.RedisPubSubListener;
-import org.redisson.client.codec.Codec;
-import org.redisson.client.protocol.RedisCommand;
-import org.redisson.client.protocol.pubsub.PubSubType;
+import org.redisson.client.*;
 import org.redisson.cluster.ClusterSlotRange;
-import org.redisson.config.BaseMasterSlaveServersConfig;
-import org.redisson.config.Config;
-import org.redisson.config.MasterSlaveServersConfig;
-import org.redisson.config.ReadMode;
-import org.redisson.connection.ClientConnectionsEntry.FreezeReason;
-import org.redisson.misc.InfinitySemaphoreLatch;
-import org.redisson.misc.RPromise;
-import org.redisson.misc.RedissonPromise;
-import org.redisson.pubsub.AsyncSemaphore;
-import org.redisson.pubsub.TransferListener;
+import org.redisson.command.CommandAsyncExecutor;
+import org.redisson.command.CommandAsyncService;
+import org.redisson.config.*;
+import org.redisson.liveobject.core.RedissonObjectBuilder;
+import org.redisson.misc.RedisURI;
+import org.redisson.pubsub.PublishSubscribeService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.netty.channel.EventLoopGroup;
-import io.netty.channel.epoll.EpollEventLoopGroup;
-import io.netty.channel.epoll.EpollSocketChannel;
-import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.SocketChannel;
-import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.util.HashedWheelTimer;
-import io.netty.util.Timeout;
-import io.netty.util.Timer;
-import io.netty.util.TimerTask;
-import io.netty.util.concurrent.DefaultThreadFactory;
-import io.netty.util.concurrent.Future;
-import io.netty.util.concurrent.FutureListener;
-import io.netty.util.internal.PlatformDependent;
+import java.net.InetSocketAddress;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  *
@@ -80,250 +42,382 @@ import io.netty.util.internal.PlatformDependent;
  */
 public class MasterSlaveConnectionManager implements ConnectionManager {
 
-    private final Timeout dummyTimeout = new Timeout() {
-        @Override
-        public Timer timer() {
-            return null;
-        }
-
-        @Override
-        public TimerTask task() {
-            return null;
-        }
-
-        @Override
-        public boolean isExpired() {
-            return false;
-        }
-
-        @Override
-        public boolean isCancelled() {
-            return false;
-        }
-
-        @Override
-        public boolean cancel() {
-            return false;
-        }
-    };
-
     public static final int MAX_SLOT = 16384;
 
     protected final ClusterSlotRange singleSlotRange = new ClusterSlotRange(0, MAX_SLOT-1);
 
     private final Logger log = LoggerFactory.getLogger(getClass());
 
-    private HashedWheelTimer timer;
-
-    protected Codec codec;
-
-    protected EventLoopGroup group;
-
-    protected ConnectionInitializer connectListener = new DefaultConnectionListener();
-
-    protected Class<? extends SocketChannel> socketChannelClass;
-
-    protected final ConcurrentMap<String, PubSubConnectionEntry> name2PubSubConnection = PlatformDependent.newConcurrentHashMap();
-    
-    protected final Queue<PubSubConnectionEntry> freePubSubConnections = new ConcurrentLinkedQueue<PubSubConnectionEntry>();
+    protected DNSMonitor dnsMonitor;
 
     protected MasterSlaveServersConfig config;
 
-    private final Map<Integer, MasterSlaveEntry> entries = PlatformDependent.newConcurrentHashMap();
+    private MasterSlaveEntry masterSlaveEntry;
 
-    private final RPromise<Boolean> shutdownPromise;
+    protected final PublishSubscribeService subscribeService;
 
-    private final InfinitySemaphoreLatch shutdownLatch = new InfinitySemaphoreLatch();
+    protected final ServiceManager serviceManager;
 
-    private final Set<RedisClientEntry> clients = Collections.newSetFromMap(PlatformDependent.<RedisClientEntry, Boolean>newConcurrentHashMap());
+    private final Map<RedisURI, RedisConnection> nodeConnections = new ConcurrentHashMap<>();
 
-    private IdleConnectionWatcher connectionWatcher;
+    protected final AtomicReference<CompletableFuture<Void>> lazyConnectLatch = new AtomicReference<>();
 
-    private final ConnectionEventsHub connectionEventsHub = new ConnectionEventsHub();
-    
-    private final AsyncSemaphore[] locks = new AsyncSemaphore[50];
-    
-    private final ExecutorService executor; 
-    
-    private final AsyncSemaphore freePubSubLock = new AsyncSemaphore(1);
-    
-    {
-        for (int i = 0; i < locks.length; i++) {
-            locks[i] = new AsyncSemaphore(1);
-        }
-    }
+    private boolean lastAttempt;
 
-    public MasterSlaveConnectionManager(MasterSlaveServersConfig cfg, Config config) {
-        this(config);
-        initTimer(cfg);
-        init(cfg);
-    }
-
-    public MasterSlaveConnectionManager(Config cfg) {
-        Version.logVersion();
-
-        if (cfg.isUseLinuxNativeEpoll()) {
-            if (cfg.getEventLoopGroup() == null) {
-                this.group = new EpollEventLoopGroup(cfg.getNettyThreads());
-            } else {
-                this.group = cfg.getEventLoopGroup();
+    public MasterSlaveConnectionManager(BaseMasterSlaveServersConfig<?> cfg, Config configCopy) {
+        if (cfg instanceof MasterSlaveServersConfig) {
+            this.config = (MasterSlaveServersConfig) cfg;
+            if (this.config.getSlaveAddresses().isEmpty()
+                    && (this.config.getReadMode() == ReadMode.SLAVE || this.config.getReadMode() == ReadMode.MASTER_SLAVE)) {
+                throw new IllegalArgumentException("Slaves aren't defined. readMode can't be SLAVE or MASTER_SLAVE");
             }
-
-            this.socketChannelClass = EpollSocketChannel.class;
         } else {
-            if (cfg.getEventLoopGroup() == null) {
-                this.group = new NioEventLoopGroup(cfg.getNettyThreads(), new DefaultThreadFactory("redisson-netty"));
-            } else {
-                this.group = cfg.getEventLoopGroup();
-            }
-
-            this.socketChannelClass = NioSocketChannel.class;
-//            if (cfg.getEventLoopGroup() == null) {
-//                this.group = new OioEventLoopGroup(cfg.getThreads());
-//            } else {
-//                this.group = cfg.getEventLoopGroup();
-//            }
-//
-//            this.socketChannelClass = OioSocketChannel.class;
+            this.config = create(cfg);
         }
-        if (cfg.getExecutor() == null) {
-            int threads = Runtime.getRuntime().availableProcessors() * 2;
-            if (cfg.getThreads() != 0) {
-                threads = cfg.getThreads();
-            }
-            executor = Executors.newFixedThreadPool(threads, new DefaultThreadFactory("redisson"));
-        } else {
-            executor = cfg.getExecutor();
-        }
-       
-        this.codec = cfg.getCodec();
-        this.shutdownPromise = newPromise();
-    }
 
-    public boolean isClusterMode() {
-        return false;
-    }
-
-    public IdleConnectionWatcher getConnectionWatcher() {
-        return connectionWatcher;
+        serviceManager = new ServiceManager(this.config, configCopy);
+        subscribeService = new PublishSubscribeService(this);
     }
 
     @Override
-    public MasterSlaveServersConfig getConfig() {
-        return config;
+    public ServiceManager getServiceManager() {
+        return serviceManager;
+    }
+
+    protected void closeNodeConnections() {
+        nodeConnections.values().stream()
+                .map(c -> c.getRedisClient().shutdownAsync())
+                .forEach(f -> f.toCompletableFuture().join());
+    }
+
+    protected void closeNodeConnection(RedisConnection conn) {
+        if (nodeConnections.values().removeAll(Arrays.asList(conn))) {
+            conn.closeAsync();
+        }
+    }
+
+    protected final void disconnectNode(RedisURI addr) {
+        RedisConnection conn = nodeConnections.remove(addr);
+        if (conn != null) {
+            nodeConnections.values().removeAll(Arrays.asList(conn));
+            conn.closeAsync();
+        }
+    }
+
+    protected final CompletionStage<RedisConnection> connectToNode(BaseConfig<?> cfg, RedisURI addr, String sslHostname) {
+        return connectToNode(NodeType.MASTER, cfg, addr, sslHostname);
+    }
+
+    protected final CompletionStage<RedisConnection> connectToNode(NodeType type, BaseConfig<?> cfg, RedisURI addr, String sslHostname) {
+        RedisConnection conn = nodeConnections.get(addr);
+        if (conn != null) {
+            if (!conn.isActive()) {
+                closeNodeConnection(conn);
+            } else {
+                return CompletableFuture.completedFuture(conn);
+            }
+        }
+
+        RedisClient client = createClient(type, addr, cfg.getConnectTimeout(), cfg.getTimeout(), sslHostname);
+        CompletionStage<RedisConnection> future = client.connectAsync();
+        return future.thenCompose(connection -> {
+            if (connection.isActive()) {
+                if (!addr.isIP()) {
+                    RedisURI address = new RedisURI(addr.getScheme()
+                                 + "://" + connection.getRedisClient().getAddr().getAddress().getHostAddress()
+                                 + ":" + connection.getRedisClient().getAddr().getPort());
+                    nodeConnections.put(address, connection);
+                }
+                nodeConnections.put(addr, connection);
+                return CompletableFuture.completedFuture(connection);
+            } else {
+                connection.closeAsync();
+                CompletableFuture<RedisConnection> f = new CompletableFuture<>();
+                f.completeExceptionally(new RedisException("Connection to " + connection.getRedisClient().getAddr() + " is not active!"));
+                return f;
+            }
+        });
     }
 
     @Override
-    public Codec getCodec() {
-        return codec;
+    public Collection<MasterSlaveEntry> getEntrySet() {
+        lazyConnect();
+
+        if (masterSlaveEntry != null) {
+            return Collections.singletonList(masterSlaveEntry);
+        }
+        return Collections.emptyList();
     }
 
-    public Set<MasterSlaveEntry> getEntrySet() {
-        return new HashSet<MasterSlaveEntry>(entries.values());
-    }
-    
-    protected void init(MasterSlaveServersConfig config) {
-        this.config = config;
+    protected final void lazyConnect() {
+        if (isInitialized()) {
+            return;
+        }
 
-        connectionWatcher = new IdleConnectionWatcher(this, config);
+        CompletableFuture<Void> newFuture = new CompletableFuture<>();
+        if (!lazyConnectLatch.compareAndSet(null, newFuture)) {
+            CompletableFuture<Void> currentFuture = lazyConnectLatch.get();
+            if (currentFuture.isCompletedExceptionally()) {
+                if (!lazyConnectLatch.compareAndSet(currentFuture, newFuture)) {
+                    lazyConnectLatch.get().join();
+                    return;
+                }
+            } else {
+                lazyConnectLatch.get().join();
+                return;
+            }
+        }
 
         try {
-            initEntry(config);
-        } catch (RuntimeException e) {
-            stopThreads();
+            connect();
+            newFuture.complete(null);
+        } catch (Exception e) {
+            newFuture.completeExceptionally(e);
             throw e;
         }
     }
 
-    protected void initTimer(MasterSlaveServersConfig config) {
-        int[] timeouts = new int[]{config.getRetryInterval(), config.getTimeout(), config.getReconnectionTimeout()};
-        Arrays.sort(timeouts);
-        int minTimeout = timeouts[0];
-        if (minTimeout % 100 != 0) {
-            minTimeout = (minTimeout % 100) / 2;
-        } else if (minTimeout == 100) {
-            minTimeout = 50;
-        } else {
-            minTimeout = 100;
-        }
-        timer = new HashedWheelTimer(minTimeout, TimeUnit.MILLISECONDS);
-    }
-
-    public ConnectionInitializer getConnectListener() {
-        return connectListener;
-    }
-
-    protected void initEntry(MasterSlaveServersConfig config) {
-        HashSet<ClusterSlotRange> slots = new HashSet<ClusterSlotRange>();
-        slots.add(singleSlotRange);
-
-        MasterSlaveEntry entry;
-        if (config.getReadMode() == ReadMode.MASTER) {
-            entry = new SingleEntry(slots, this, config);
-            RFuture<Void> f = entry.setupMasterEntry(config.getMasterAddress().getHost(), config.getMasterAddress().getPort());
-            f.syncUninterruptibly();
-        } else {
-            entry = createMasterSlaveEntry(config, slots);
-        }
-        
-        for (int slot = singleSlotRange.getStartSlot(); slot < singleSlotRange.getEndSlot() + 1; slot++) {
-            addEntry(slot, entry);
+    @Override
+    public final void connect() {
+        int attempts = config.getRetryAttempts() + 1;
+        for (int i = 0; i < attempts; i++) {
+            try {
+                if (i == attempts - 1) {
+                    lastAttempt = true;
+                }
+                doConnect(u -> null);
+                return;
+            } catch (IllegalArgumentException e) {
+                shutdown();
+                throw e;
+            } catch (Exception e) {
+                if (i == attempts - 1) {
+                    lastAttempt = false;
+                    throw e;
+                }
+                try {
+                    Thread.sleep(config.getRetryInterval());
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
         }
     }
 
-    protected MasterSlaveEntry createMasterSlaveEntry(MasterSlaveServersConfig config,
-            HashSet<ClusterSlotRange> slots) {
-        MasterSlaveEntry entry = new MasterSlaveEntry(slots, this, config);
-        List<RFuture<Void>> fs = entry.initSlaveBalancer(java.util.Collections.<URI>emptySet());
-        for (RFuture<Void> future : fs) {
-            future.syncUninterruptibly();
+    protected void doConnect(Function<RedisURI, String> hostnameMapper) {
+        try {
+            if (config.isSlaveNotUsed()) {
+                masterSlaveEntry = new SingleEntry(this, config);
+            } else {
+                masterSlaveEntry = new MasterSlaveEntry(this, config);
+            }
+
+            RedisURI uri = new RedisURI(config.getMasterAddress());
+            String hostname = hostnameMapper.apply(uri);
+            CompletableFuture<RedisClient> masterFuture = masterSlaveEntry.setupMasterEntry(uri, hostname);
+            try {
+                if (config.getMasterConnectionMinimumIdleSize() == 0) {
+                    masterFuture.join();
+                } else {
+                    masterFuture.get(config.getConnectTimeout()*config.getMasterConnectionMinimumIdleSize(), TimeUnit.MILLISECONDS);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (ExecutionException | TimeoutException e) {
+                throw new RedisConnectionException(e);
+            }
+
+            if (!config.isSlaveNotUsed()) {
+                CompletableFuture<Void> fs = masterSlaveEntry.initSlaveBalancer(hostnameMapper);
+                try {
+                    if (config.getSlaveConnectionMinimumIdleSize() == 0) {
+                        fs.join();
+                    } else {
+                        fs.get(config.getConnectTimeout()*config.getSlaveConnectionMinimumIdleSize(), TimeUnit.MILLISECONDS);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException | TimeoutException e) {
+                    throw new RedisConnectionException(e);
+                }
+            }
+
+            startDNSMonitoring(masterFuture.getNow(null));
+        } catch (Exception e) {
+            internalShutdown();
+            if (e instanceof CompletionException) {
+                if (e.getCause() instanceof RuntimeException) {
+                    throw (RuntimeException) e.getCause();
+                }
+                throw new RedisConnectionException(e.getCause());
+            }
+            throw e;
         }
-        RFuture<Void> f = entry.setupMasterEntry(config.getMasterAddress().getHost(), config.getMasterAddress().getPort());
-        f.syncUninterruptibly();
-        return entry;
+    }
+
+    protected void startDNSMonitoring(RedisClient masterHost) {
+        if (masterHost.getConfig().getAddress().isIP()) {
+            return;
+        }
+
+        if (config.getDnsMonitoringInterval() != -1) {
+            Set<RedisURI> slaveAddresses = config.getSlaveAddresses().stream().map(r -> new RedisURI(r)).collect(Collectors.toSet());
+            dnsMonitor = new DNSMonitor(this, masterHost,
+                                            slaveAddresses, config.getDnsMonitoringInterval(), serviceManager.getResolverGroup());
+            dnsMonitor.start();
+        }
     }
 
     protected MasterSlaveServersConfig create(BaseMasterSlaveServersConfig<?> cfg) {
         MasterSlaveServersConfig c = new MasterSlaveServersConfig();
+
+        c.setPingConnectionInterval(cfg.getPingConnectionInterval());
+        c.setSslEnableEndpointIdentification(cfg.isSslEnableEndpointIdentification());
+        c.setSslProvider(cfg.getSslProvider());
+        c.setSslKeystoreType(cfg.getSslKeystoreType());
+        c.setSslTruststore(cfg.getSslTruststore());
+        c.setSslTruststorePassword(cfg.getSslTruststorePassword());
+        c.setSslKeystore(cfg.getSslKeystore());
+        c.setSslKeystorePassword(cfg.getSslKeystorePassword());
+        c.setSslProtocols(cfg.getSslProtocols());
+        c.setSslCiphers(cfg.getSslCiphers());
+        c.setSslKeyManagerFactory(cfg.getSslKeyManagerFactory());
+        c.setSslTrustManagerFactory(cfg.getSslTrustManagerFactory());
+
         c.setRetryInterval(cfg.getRetryInterval());
         c.setRetryAttempts(cfg.getRetryAttempts());
         c.setTimeout(cfg.getTimeout());
-        c.setPingTimeout(cfg.getPingTimeout());
         c.setLoadBalancer(cfg.getLoadBalancer());
         c.setPassword(cfg.getPassword());
+        c.setUsername(cfg.getUsername());
         c.setClientName(cfg.getClientName());
         c.setMasterConnectionPoolSize(cfg.getMasterConnectionPoolSize());
         c.setSlaveConnectionPoolSize(cfg.getSlaveConnectionPoolSize());
-        c.setSlaveSubscriptionConnectionPoolSize(cfg.getSlaveSubscriptionConnectionPoolSize());
+        c.setSubscriptionConnectionPoolSize(cfg.getSubscriptionConnectionPoolSize());
         c.setSubscriptionsPerConnection(cfg.getSubscriptionsPerConnection());
         c.setConnectTimeout(cfg.getConnectTimeout());
         c.setIdleConnectionTimeout(cfg.getIdleConnectionTimeout());
 
-        c.setFailedAttempts(cfg.getFailedAttempts());
-        c.setReconnectionTimeout(cfg.getReconnectionTimeout());
+        c.setFailedSlaveReconnectionInterval(cfg.getFailedSlaveReconnectionInterval());
+        c.setFailedSlaveNodeDetector(cfg.getFailedSlaveNodeDetector());
         c.setMasterConnectionMinimumIdleSize(cfg.getMasterConnectionMinimumIdleSize());
         c.setSlaveConnectionMinimumIdleSize(cfg.getSlaveConnectionMinimumIdleSize());
-        c.setSlaveSubscriptionConnectionMinimumIdleSize(cfg.getSlaveSubscriptionConnectionMinimumIdleSize());
+        c.setSubscriptionConnectionMinimumIdleSize(cfg.getSubscriptionConnectionMinimumIdleSize());
         c.setReadMode(cfg.getReadMode());
+        c.setSubscriptionMode(cfg.getSubscriptionMode());
+        c.setDnsMonitoringInterval(cfg.getDnsMonitoringInterval());
+        c.setKeepAlive(cfg.isKeepAlive());
+        c.setTcpKeepAliveCount(cfg.getTcpKeepAliveCount());
+        c.setTcpKeepAliveIdle(cfg.getTcpKeepAliveIdle());
+        c.setTcpKeepAliveInterval(cfg.getTcpKeepAliveInterval());
+        c.setTcpUserTimeout(cfg.getTcpUserTimeout());
+        c.setTcpNoDelay(cfg.isTcpNoDelay());
+        c.setNameMapper(cfg.getNameMapper());
+        c.setCredentialsResolver(cfg.getCredentialsResolver());
+        c.setCommandMapper(cfg.getCommandMapper());
+        c.setSubscriptionTimeout(cfg.getSubscriptionTimeout());
 
         return c;
     }
 
     @Override
-    public RedisClient createClient(NodeType type, String host, int port) {
-        RedisClient client = createClient(host, port, config.getConnectTimeout(), config.getRetryInterval() * config.getRetryAttempts());
-        clients.add(new RedisClientEntry(client, this, type));
+    public RedisClient createClient(NodeType type, RedisURI address, String sslHostname) {
+        RedisClient client = createClient(type, address, config.getConnectTimeout(), config.getTimeout(), sslHostname);
         return client;
     }
 
-    public void shutdownAsync(RedisClient client) {
-        clients.remove(new RedisClientEntry(client, this, null));
-        client.shutdownAsync();
+    @Override
+    public RedisClient createClient(NodeType type, InetSocketAddress address, RedisURI uri, String sslHostname) {
+        RedisClient client = createClient(type, address, uri, config.getConnectTimeout(), config.getTimeout(), sslHostname);
+        return client;
     }
 
-    @Override
-    public RedisClient createClient(String host, int port, int timeout, int commandTimeout) {
-        return new RedisClient(timer, executor, group, socketChannelClass, host, port, timeout, commandTimeout);
+    protected RedisClient createClient(NodeType type, RedisURI address, int timeout, int commandTimeout, String sslHostname) {
+        RedisClientConfig redisConfig = createRedisConfig(type, address, timeout, commandTimeout, sslHostname);
+        return RedisClient.create(redisConfig);
+    }
+
+    private RedisClient createClient(NodeType type, InetSocketAddress address, RedisURI uri, int timeout, int commandTimeout, String sslHostname) {
+        RedisClientConfig redisConfig = createRedisConfig(type, null, timeout, commandTimeout, sslHostname);
+        redisConfig.setAddress(address, uri);
+        return RedisClient.create(redisConfig);
+    }
+
+    protected RedisClientConfig createRedisConfig(NodeType type, RedisURI address, int timeout, int commandTimeout, String sslHostname) {
+        RedisClientConfig redisConfig = new RedisClientConfig();
+        redisConfig.setAddress(address)
+                .setTimer(serviceManager.getTimer())
+                .setExecutor(serviceManager.getExecutor())
+                .setResolverGroup(serviceManager.getResolverGroup())
+                .setGroup(serviceManager.getGroup())
+                .setSocketChannelClass(serviceManager.getSocketChannelClass())
+                .setConnectTimeout(timeout)
+                .setCommandTimeout(commandTimeout)
+                .setSslHostname(sslHostname)
+                .setSslEnableEndpointIdentification(config.isSslEnableEndpointIdentification())
+                .setSslProvider(config.getSslProvider())
+                .setSslKeystoreType(config.getSslKeystoreType())
+                .setSslTruststore(config.getSslTruststore())
+                .setSslTruststorePassword(config.getSslTruststorePassword())
+                .setSslKeystore(config.getSslKeystore())
+                .setSslKeystorePassword(config.getSslKeystorePassword())
+                .setSslProtocols(config.getSslProtocols())
+                .setSslCiphers(config.getSslCiphers())
+                .setSslKeyManagerFactory(config.getSslKeyManagerFactory())
+                .setSslTrustManagerFactory(config.getSslTrustManagerFactory())
+                .setClientName(config.getClientName())
+                .setKeepPubSubOrder(serviceManager.getCfg().isKeepPubSubOrder())
+                .setPingConnectionInterval(config.getPingConnectionInterval())
+                .setKeepAlive(config.isKeepAlive())
+                .setTcpKeepAliveCount(config.getTcpKeepAliveCount())
+                .setTcpKeepAliveIdle(config.getTcpKeepAliveIdle())
+                .setTcpKeepAliveInterval(config.getTcpKeepAliveInterval())
+                .setTcpUserTimeout(config.getTcpUserTimeout())
+                .setTcpNoDelay(config.isTcpNoDelay())
+                .setUsername(config.getUsername())
+                .setPassword(config.getPassword())
+                .setNettyHook(serviceManager.getCfg().getNettyHook())
+                .setFailedNodeDetector(config.getFailedSlaveNodeDetector())
+                .setProtocol(serviceManager.getCfg().getProtocol())
+                .setCommandMapper(config.getCommandMapper())
+                .setCredentialsResolver(config.getCredentialsResolver())
+                .setConnectedListener(addr -> {
+                    if (!serviceManager.isShuttingDown()) {
+                        NodeType nt = getNodeType(type, addr);
+                        serviceManager.getConnectionEventsHub().fireConnect(addr, nt);
+                    }
+                })
+                .setDisconnectedListener(addr -> {
+                    if (!serviceManager.isShuttingDown()) {
+                        NodeType nt = getNodeType(type, addr);
+                        serviceManager.getConnectionEventsHub().fireDisconnect(addr, nt);
+                    }
+                });
+
+        if (type != NodeType.SENTINEL) {
+            redisConfig.setDatabase(config.getDatabase());
+        }
+
+        return redisConfig;
+    }
+
+    private NodeType getNodeType(NodeType type, InetSocketAddress address) {
+        if (type != NodeType.SENTINEL) {
+            MasterSlaveEntry entry = getEntry(address);
+            if (entry != null) {
+                if (!entry.isInit()) {
+                    return type;
+                }
+                InetSocketAddress addr = entry.getClient().getAddr();
+                if (addr.getAddress().equals(address.getAddress())
+                        && addr.getPort() == address.getPort()) {
+                    return NodeType.MASTER;
+                }
+            }
+            return NodeType.SLAVE;
+        }
+        return type;
     }
 
     @Override
@@ -332,499 +426,147 @@ public class MasterSlaveConnectionManager implements ConnectionManager {
     }
 
     @Override
-    public PubSubConnectionEntry getPubSubEntry(String channelName) {
-        return name2PubSubConnection.get(channelName);
+    public int calcSlot(byte[] key) {
+        return singleSlotRange.getStartSlot();
     }
 
     @Override
-    public RFuture<PubSubConnectionEntry> psubscribe(final String channelName, final Codec codec, final RedisPubSubListener<?> listener) {
-        final AsyncSemaphore lock = getSemaphore(channelName);
-        final RPromise<PubSubConnectionEntry> result = newPromise();
-        lock.acquire(new Runnable() {
-            @Override
-            public void run() {
-                RFuture<PubSubConnectionEntry> future = psubscribe(channelName, codec, listener, lock);
-                future.addListener(new TransferListener<PubSubConnectionEntry>(result));
-            }
-        });
-        return result;
-    }
-    
-    public RFuture<PubSubConnectionEntry> psubscribe(String channelName, Codec codec, RedisPubSubListener<?> listener, AsyncSemaphore semaphore) {
-        RPromise<PubSubConnectionEntry> promise = newPromise();
-        subscribe(codec, channelName, listener, promise, PubSubType.PSUBSCRIBE, semaphore);
-        return promise;
-    }
-
-    public RFuture<PubSubConnectionEntry> subscribe(final Codec codec, final String channelName, final RedisPubSubListener<?> listener) {
-        final AsyncSemaphore lock = getSemaphore(channelName);
-        final RPromise<PubSubConnectionEntry> result = newPromise();
-        lock.acquire(new Runnable() {
-            @Override
-            public void run() {
-                RFuture<PubSubConnectionEntry> future = subscribe(codec, channelName, listener, lock);
-                future.addListener(new TransferListener<PubSubConnectionEntry>(result));
-            }
-        });
-        return result;
-    }
-    
-    public RFuture<PubSubConnectionEntry> subscribe(Codec codec, String channelName, RedisPubSubListener<?> listener, AsyncSemaphore semaphore) {
-        RPromise<PubSubConnectionEntry> promise = newPromise();
-        subscribe(codec, channelName, listener, promise, PubSubType.SUBSCRIBE, semaphore);
-        return promise;
-    }
-
-    public AsyncSemaphore getSemaphore(String channelName) {
-        return locks[Math.abs(channelName.hashCode() % locks.length)];
-    }
-    
-    private void subscribe(final Codec codec, final String channelName, final RedisPubSubListener<?> listener, 
-            final RPromise<PubSubConnectionEntry> promise, final PubSubType type, final AsyncSemaphore lock) {
-        final PubSubConnectionEntry connEntry = name2PubSubConnection.get(channelName);
-        if (connEntry != null) {
-            connEntry.addListener(channelName, listener);
-            connEntry.getSubscribeFuture(channelName, type).addListener(new FutureListener<Void>() {
-                @Override
-                public void operationComplete(Future<Void> future) throws Exception {
-                    lock.release();
-                    promise.trySuccess(connEntry);
-                }
-            });
-            return;
-        }
-
-        freePubSubLock.acquire(new Runnable() {
-
-            @Override
-            public void run() {
-                if (promise.isDone()) {
-                    return;
-                }
-                
-                final PubSubConnectionEntry freeEntry = freePubSubConnections.peek();
-                if (freeEntry == null) {
-                    connect(codec, channelName, listener, promise, type, lock);
-                    return;
-                }
-                
-                int remainFreeAmount = freeEntry.tryAcquire();
-                if (remainFreeAmount == -1) {
-                    throw new IllegalStateException();
-                }
-                
-                final PubSubConnectionEntry oldEntry = name2PubSubConnection.putIfAbsent(channelName, freeEntry);
-                if (oldEntry != null) {
-                    freeEntry.release();
-                    freePubSubLock.release();
-                    
-                    oldEntry.addListener(channelName, listener);
-                    oldEntry.getSubscribeFuture(channelName, type).addListener(new FutureListener<Void>() {
-                        @Override
-                        public void operationComplete(Future<Void> future) throws Exception {
-                            lock.release();
-                            promise.trySuccess(oldEntry);
-                        }
-                    });
-                    return;
-                }
-                
-                if (remainFreeAmount == 0) {
-                    freePubSubConnections.poll();
-                }
-                freePubSubLock.release();
-                
-                freeEntry.addListener(channelName, listener);
-                freeEntry.getSubscribeFuture(channelName, type).addListener(new FutureListener<Void>() {
-                    @Override
-                    public void operationComplete(Future<Void> future) throws Exception {
-                        lock.release();
-                        promise.trySuccess(freeEntry);
-                    }
-                });
-                
-                if (PubSubType.PSUBSCRIBE == type) {
-                    freeEntry.psubscribe(codec, channelName);
-                } else {
-                    freeEntry.subscribe(codec, channelName);
-                }
-            }
-            
-        });
-    }
-
-    private void connect(final Codec codec, final String channelName, final RedisPubSubListener<?> listener,
-            final RPromise<PubSubConnectionEntry> promise, final PubSubType type, final AsyncSemaphore lock) {
-        final int slot = calcSlot(channelName);
-        RFuture<RedisPubSubConnection> connFuture = nextPubSubConnection(slot);
-        connFuture.addListener(new FutureListener<RedisPubSubConnection>() {
-
-            @Override
-            public void operationComplete(Future<RedisPubSubConnection> future) throws Exception {
-                if (!future.isSuccess()) {
-                    freePubSubLock.release();
-                    lock.release();
-                    promise.tryFailure(future.cause());
-                    return;
-                }
-
-                RedisPubSubConnection conn = future.getNow();
-                
-                final PubSubConnectionEntry entry = new PubSubConnectionEntry(conn, config.getSubscriptionsPerConnection());
-                entry.tryAcquire();
-                
-                final PubSubConnectionEntry oldEntry = name2PubSubConnection.putIfAbsent(channelName, entry);
-                if (oldEntry != null) {
-                    releaseSubscribeConnection(slot, entry);
-                    
-                    freePubSubLock.release();
-                    
-                    oldEntry.addListener(channelName, listener);
-                    oldEntry.getSubscribeFuture(channelName, type).addListener(new FutureListener<Void>() {
-                        @Override
-                        public void operationComplete(Future<Void> future) throws Exception {
-                            lock.release();
-                            promise.trySuccess(oldEntry);
-                        }
-                    });
-                    return;
-                }
-                
-                freePubSubConnections.add(entry);
-                freePubSubLock.release();
-                
-                entry.addListener(channelName, listener);
-                entry.getSubscribeFuture(channelName, type).addListener(new FutureListener<Void>() {
-                    @Override
-                    public void operationComplete(Future<Void> future) throws Exception {
-                        lock.release();
-                        promise.trySuccess(entry);
-                    }
-                });
-                
-                if (PubSubType.PSUBSCRIBE == type) {
-                    entry.psubscribe(codec, channelName);
-                } else {
-                    entry.subscribe(codec, channelName);
-                }
-                
-            }
-        });
-    }
-
-    public Codec unsubscribe(final String channelName, final AsyncSemaphore lock) {
-        final PubSubConnectionEntry entry = name2PubSubConnection.remove(channelName);
-        if (entry == null) {
-            lock.release();
-            return null;
-        }
-        
-        Codec entryCodec = entry.getConnection().getChannels().get(channelName);
-        entry.unsubscribe(channelName, new BaseRedisPubSubListener() {
-            
-            @Override
-            public boolean onStatus(PubSubType type, String channel) {
-                if (type == PubSubType.UNSUBSCRIBE && channel.equals(channelName)) {
-                    
-                    if (entry.release() == 1) {
-                        freePubSubConnections.add(entry);
-                    }
-                    
-                    lock.release();
-                    return true;
-                }
-                return false;
-            }
-            
-        });
-        
-        return entryCodec;
-    }
-    
-    @Override
-    public RFuture<Codec> unsubscribe(final String channelName, boolean temporaryDown) {
-        final PubSubConnectionEntry entry = name2PubSubConnection.remove(channelName);
-        if (entry == null) {
-            return null;
-        }
-        freePubSubConnections.remove(entry);
-        
-        final Codec entryCodec = entry.getConnection().getChannels().get(channelName);
-        if (temporaryDown) {
-            final RPromise<Codec> result = newPromise();
-            entry.unsubscribe(channelName, new BaseRedisPubSubListener() {
-                
-                @Override
-                public boolean onStatus(PubSubType type, String channel) {
-                    if (type == PubSubType.UNSUBSCRIBE && channel.equals(channelName)) {
-                        result.trySuccess(entryCodec);
-                        return true;
-                    }
-                    return false;
-                }
-                
-            });
-            return result;
-        }
-        entry.unsubscribe(channelName, null);
-        return newSucceededFuture(entryCodec);
-    }
-    
-    public Codec punsubscribe(final String channelName, final AsyncSemaphore lock) {
-        final PubSubConnectionEntry entry = name2PubSubConnection.remove(channelName);
-        if (entry == null) {
-            lock.release();
-            return null;
-        }
-        
-        Codec entryCodec = entry.getConnection().getPatternChannels().get(channelName);
-        entry.punsubscribe(channelName, new BaseRedisPubSubListener() {
-            
-            @Override
-            public boolean onStatus(PubSubType type, String channel) {
-                if (type == PubSubType.PUNSUBSCRIBE && channel.equals(channelName)) {
-                    
-                    if (entry.release() == 1) {
-                        freePubSubConnections.add(entry);
-                    }
-                    
-                    lock.release();
-                    return true;
-                }
-                return false;
-            }
-            
-        });
-        
-        return entryCodec;
-    }
-
-    
-    @Override
-    public RFuture<Codec> punsubscribe(final String channelName, boolean temporaryDown) {
-        final PubSubConnectionEntry entry = name2PubSubConnection.remove(channelName);
-        if (entry == null) {
-            return null;
-        }
-        freePubSubConnections.remove(entry);
-        
-        final Codec entryCodec = entry.getConnection().getChannels().get(channelName);
-        if (temporaryDown) {
-            final RPromise<Codec> result = newPromise();
-            entry.punsubscribe(channelName, new BaseRedisPubSubListener() {
-                
-                @Override
-                public boolean onStatus(PubSubType type, String channel) {
-                    if (type == PubSubType.PUNSUBSCRIBE && channel.equals(channelName)) {
-                        result.trySuccess(entryCodec);
-                        return true;
-                    }
-                    return false;
-                }
-                
-            });
-            return result;
-        }
-        entry.punsubscribe(channelName, null);
-        return newSucceededFuture(entryCodec);
+    public int calcSlot(ByteBuf key) {
+        return singleSlotRange.getStartSlot();
     }
 
     @Override
-    public MasterSlaveEntry getEntry(InetSocketAddress addr) {
-        // TODO optimize
-        for (Entry<Integer, MasterSlaveEntry> entry : entries.entrySet()) {
-            if (entry.getValue().getClient().getAddr().equals(addr)) {
-                return entry.getValue();
-            }
-        }
-        return null;
+    public MasterSlaveEntry getEntry(InetSocketAddress address) {
+        lazyConnect();
+
+        return masterSlaveEntry;
+    }
+
+    @Override
+    public MasterSlaveEntry getEntry(RedisURI addr) {
+        lazyConnect();
+
+        return masterSlaveEntry;
+    }
+
+    @Override
+    public MasterSlaveEntry getEntry(RedisClient redisClient) {
+        lazyConnect();
+
+        return masterSlaveEntry;
+    }
+
+    @Override
+    public MasterSlaveEntry getEntry(String name) {
+        int slot = calcSlot(name);
+        return getEntry(slot);
     }
 
     public MasterSlaveEntry getEntry(int slot) {
-        return entries.get(slot);
-    }
-    
-    protected void slaveDown(ClusterSlotRange slotRange, String host, int port, FreezeReason freezeReason) {
-        getEntry(slotRange.getStartSlot()).slaveDown(host, port, freezeReason);
-    }
+        lazyConnect();
 
-    protected void changeMaster(int slot, String host, int port) {
-        getEntry(slot).changeMaster(host, port);
-    }
-
-    protected void addEntry(Integer slot, MasterSlaveEntry entry) {
-        entries.put(slot, entry);
-    }
-
-    protected MasterSlaveEntry removeMaster(Integer slot) {
-        return entries.remove(slot);
+        return masterSlaveEntry;
     }
 
     @Override
-    public RFuture<RedisConnection> connectionWriteOp(NodeSource source, RedisCommand<?> command) {
-        MasterSlaveEntry entry = source.getEntry();
-        if (entry == null) {
-            entry = getEntry(source);
-        }
-        return entry.connectionWriteOp();
-    }
-
-    private MasterSlaveEntry getEntry(NodeSource source) {
-        // workaround for slots in migration state
-        if (source.getRedirect() != null) {
-            MasterSlaveEntry e = getEntry(source.getAddr());
-            if (e == null) {
-                throw new RedisNodeNotFoundException("No node for slot: " + source.getAddr());
-            }
-            return e;
-        }
-        
-        MasterSlaveEntry e = getEntry(source.getSlot());
-        if (e == null) {
-            throw new RedisNodeNotFoundException("No node with slot: " + source.getSlot());
-        }
-        return e;
+    public MasterSlaveEntry getWriteEntry(int slot) {
+        return getEntry(slot);
     }
 
     @Override
-    public RFuture<RedisConnection> connectionReadOp(NodeSource source, RedisCommand<?> command) {
-        MasterSlaveEntry entry = source.getEntry();
-        if (entry == null && source.getSlot() != null) {
-            entry = getEntry(source.getSlot());
-        }
-        if (source.getAddr() != null) {
-            return entry.connectionReadOp(source.getAddr());
-        }
-        return entry.connectionReadOp();
+    public MasterSlaveEntry getReadEntry(int slot) {
+        return getEntry(slot);
     }
 
-    RFuture<RedisPubSubConnection> nextPubSubConnection(int slot) {
-        return getEntry(slot).nextPubSubConnection();
+    protected CompletableFuture<RedisClient> changeMaster(int slot, RedisURI address) {
+        MasterSlaveEntry entry = getEntry(slot);
+        return entry.changeMaster(address);
     }
 
-    protected void releaseSubscribeConnection(int slot, PubSubConnectionEntry entry) {
-        this.getEntry(slot).returnPubSubConnection(entry);
-    }
-
-    @Override
-    public void releaseWrite(NodeSource source, RedisConnection connection) {
-        MasterSlaveEntry entry = source.getEntry();
-        if (entry == null) {
-            entry = getEntry(source);
+    protected void internalShutdown() {
+        if (lazyConnectLatch.get() == null && lastAttempt) {
+            shutdown();
         }
-        entry.releaseWrite(connection);
-    }
-
-    @Override
-    public void releaseRead(NodeSource source, RedisConnection connection) {
-        MasterSlaveEntry entry = source.getEntry();
-        if (entry == null) {
-            entry = getEntry(source);
-        }
-        entry.releaseRead(connection);
     }
 
     @Override
     public void shutdown() {
-        shutdown(2, 15, TimeUnit.SECONDS);//default netty value
+        shutdown(0, 10, TimeUnit.SECONDS); //default netty value
     }
 
     @Override
     public void shutdown(long quietPeriod, long timeout, TimeUnit unit) {
-        shutdownLatch.close();
-        shutdownPromise.trySuccess(true);
-        shutdownLatch.awaitUninterruptibly();
-
-        for (MasterSlaveEntry entry : entries.values()) {
-            entry.shutdown();
+        if (dnsMonitor != null) {
+            dnsMonitor.stop();
         }
-        timer.stop();
-        
-        executor.shutdown();
-        try {
-            executor.awaitTermination(timeout, unit);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        long timeoutInNanos = unit.toNanos(timeout);
+
+        serviceManager.close();
+        serviceManager.getConnectionWatcher().stop();
+        serviceManager.getResolverGroup().close();
+
+        long startTime = System.nanoTime();
+        serviceManager.shutdownFutures(timeout, unit);
+        timeoutInNanos = Math.max(0, timeoutInNanos - (System.nanoTime() - startTime));
+
+        if (isInitialized()) {
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            for (MasterSlaveEntry entry : getEntrySet()) {
+                futures.add(entry.shutdownAsync());
+            }
+            CompletableFuture<Void> future = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+
+            try {
+                startTime = System.nanoTime();
+                future.get(timeoutInNanos, TimeUnit.NANOSECONDS);
+                timeoutInNanos = Math.max(0, timeoutInNanos - (System.nanoTime() - startTime));
+            } catch (Exception e) {
+                // skip
+            }
         }
-        group.shutdownGracefully(quietPeriod, timeout, unit).syncUninterruptibly();
-    }
 
-    @Override
-    public boolean isShuttingDown() {
-        return shutdownLatch.isClosed();
-    }
+        if (serviceManager.getCfg().getExecutor() == null) {
+            serviceManager.getExecutor().shutdown();
+            try {
+                startTime = System.nanoTime();
+                serviceManager.getExecutor().awaitTermination(timeoutInNanos, TimeUnit.NANOSECONDS);
+                timeoutInNanos = Math.max(0, timeoutInNanos - (System.nanoTime() - startTime));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
 
-    @Override
-    public boolean isShutdown() {
-        return group.isTerminated();
-    }
+        serviceManager.getTimer().stop();
 
-    @Override
-    public Collection<RedisClientEntry> getClients() {
-        return Collections.unmodifiableCollection(clients);
-    }
-
-    @Override
-    public <R> RPromise<R> newPromise() {
-        return new RedissonPromise<R>();
-    }
-
-    @Override
-    public <R> RFuture<R> newSucceededFuture(R value) {
-        return RedissonPromise.newSucceededFuture(value);
-    }
-
-    @Override
-    public <R> RFuture<R> newFailedFuture(Throwable cause) {
-        return RedissonPromise.newFailedFuture(cause);
-    }
-
-    @Override
-    public EventLoopGroup getGroup() {
-        return group;
-    }
-
-    @Override
-    public Timeout newTimeout(TimerTask task, long delay, TimeUnit unit) {
-        try {
-            return timer.newTimeout(task, delay, unit);
-        } catch (IllegalStateException e) {
-            // timer is shutdown
-            return dummyTimeout;
+        if (serviceManager.getCfg().getEventLoopGroup() == null) {
+            if (timeoutInNanos < quietPeriod) {
+                quietPeriod = 0;
+            }
+            serviceManager.getGroup()
+                    .shutdownGracefully(unit.toNanos(quietPeriod), timeoutInNanos, TimeUnit.NANOSECONDS)
+                    .syncUninterruptibly();
         }
     }
 
-    @Override
-    public InfinitySemaphoreLatch getShutdownLatch() {
-        return shutdownLatch;
+    private boolean isInitialized() {
+        return !serviceManager.getCfg().isLazyInitialization()
+                    || (lazyConnectLatch.get() != null
+                            && lazyConnectLatch.get().isDone()
+                                && !lazyConnectLatch.get().isCompletedExceptionally());
     }
 
     @Override
-    public RFuture<Boolean> getShutdownPromise() {
-        return shutdownPromise;
+    public PublishSubscribeService getSubscribeService() {
+        return subscribeService;
     }
 
     @Override
-    public ConnectionEventsHub getConnectionEventsHub() {
-        return connectionEventsHub;
-    }
-
-    protected void stopThreads() {
-        timer.stop();
-        executor.shutdown();
-        try {
-            executor.awaitTermination(15, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        group.shutdownGracefully().syncUninterruptibly();
-    }
-    
-    public ExecutorService getExecutor() {
-        return executor;
-    }
-    
-    public URI getLastClusterNode() {
+    public RedisURI getLastClusterNode() {
         return null;
+    }
+
+    @Override
+    public CommandAsyncExecutor createCommandExecutor(RedissonObjectBuilder objectBuilder, RedissonObjectBuilder.ReferenceType referenceType) {
+        return new CommandAsyncService(this, objectBuilder, referenceType);
     }
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,17 +15,23 @@
  */
 package org.redisson.client.codec;
 
-import java.io.IOException;
-import java.nio.charset.Charset;
-
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.util.CharsetUtil;
 import org.redisson.client.handler.State;
 import org.redisson.client.protocol.Decoder;
 import org.redisson.client.protocol.Encoder;
+import org.redisson.codec.JsonCodec;
 
-import io.netty.buffer.ByteBuf;
-import io.netty.util.CharsetUtil;
+import java.io.IOException;
+import java.nio.charset.Charset;
 
-public class StringCodec implements Codec {
+/**
+ * 
+ * @author Nikita Koksharov
+ *
+ */
+public class StringCodec extends BaseCodec implements JsonCodec {
 
     public static final StringCodec INSTANCE = new StringCodec();
 
@@ -33,8 +39,10 @@ public class StringCodec implements Codec {
 
     private final Encoder encoder = new Encoder() {
         @Override
-        public byte[] encode(Object in) throws IOException {
-            return in.toString().getBytes(charset);
+        public ByteBuf encode(Object in) throws IOException {
+            ByteBuf out = ByteBufAllocator.DEFAULT.buffer();
+            out.writeCharSequence(in.toString(), charset);
+            return out;
         }
     };
 
@@ -74,23 +82,12 @@ public class StringCodec implements Codec {
     }
 
     @Override
-    public Decoder<Object> getMapValueDecoder() {
-        return getValueDecoder();
+    public Encoder getEncoder() {
+        return encoder;
     }
 
     @Override
-    public Encoder getMapValueEncoder() {
-        return getValueEncoder();
+    public Decoder<Object> getDecoder() {
+        return decoder;
     }
-
-    @Override
-    public Decoder<Object> getMapKeyDecoder() {
-        return getValueDecoder();
-    }
-
-    @Override
-    public Encoder getMapKeyEncoder() {
-        return getValueEncoder();
-    }
-
 }

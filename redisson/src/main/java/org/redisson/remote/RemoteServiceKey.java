@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,9 @@
  */
 package org.redisson.remote;
 
+import java.util.Arrays;
+import java.util.Objects;
+
 /**
  * 
  * @author Nikita Koksharov
@@ -24,15 +27,21 @@ public class RemoteServiceKey {
 
     private final Class<?> serviceInterface;
     private final String methodName;
-    
-    public RemoteServiceKey(Class<?> serviceInterface, String methodName) {
+    private final long[] signature;
+
+    public RemoteServiceKey(Class<?> serviceInterface, String method, long[] signature) {
         super();
         this.serviceInterface = serviceInterface;
-        this.methodName = methodName;
+        this.methodName = method;
+        this.signature = signature;
     }
     
     public String getMethodName() {
         return methodName;
+    }
+
+    public long[] getSignature() {
+        return signature;
     }
     
     public Class<?> getServiceInterface() {
@@ -40,34 +49,17 @@ public class RemoteServiceKey {
     }
 
     @Override
-    public int hashCode() {
-        final int prime = 31;
-        int result = 1;
-        result = prime * result + ((methodName == null) ? 0 : methodName.hashCode());
-        result = prime * result + ((serviceInterface == null) ? 0 : serviceInterface.getName().hashCode());
-        return result;
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        RemoteServiceKey that = (RemoteServiceKey) o;
+        return Objects.equals(serviceInterface, that.serviceInterface)
+                    && Objects.equals(methodName, that.methodName)
+                        && Objects.deepEquals(signature, that.signature);
     }
 
     @Override
-    public boolean equals(Object obj) {
-        if (this == obj)
-            return true;
-        if (obj == null)
-            return false;
-        if (getClass() != obj.getClass())
-            return false;
-        RemoteServiceKey other = (RemoteServiceKey) obj;
-        if (methodName == null) {
-            if (other.methodName != null)
-                return false;
-        } else if (!methodName.equals(other.methodName))
-            return false;
-        if (serviceInterface == null) {
-            if (other.serviceInterface != null)
-                return false;
-        } else if (!serviceInterface.equals(other.serviceInterface))
-            return false;
-        return true;
+    public int hashCode() {
+        return Objects.hash(serviceInterface, methodName, Arrays.hashCode(signature));
     }
-    
 }

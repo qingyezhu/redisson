@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,14 +16,19 @@
 package org.redisson.client;
 
 /**
+ * This error occurs when write operation over Redis connection can't be executed.
  * 
  * @author Nikita Koksharov
  *
  */
-public class WriteRedisConnectionException extends RedisException {
+public class WriteRedisConnectionException extends RedisConnectionException {
 
     private static final long serialVersionUID = -4756928186967834601L;
 
+    public WriteRedisConnectionException(String msg) {
+        super(msg);
+    }
+    
     public WriteRedisConnectionException(String msg, Throwable e) {
         super(msg, e);
     }

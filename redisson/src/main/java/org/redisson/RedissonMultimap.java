@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,31 +15,25 @@
  */
 package org.redisson;
 
-import java.net.InetSocketAddress;
-import java.util.AbstractCollection;
-import java.util.AbstractSet;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Set;
-import java.util.concurrent.TimeUnit;
-
-import org.redisson.api.RFuture;
-import org.redisson.api.RMultimap;
+import io.netty.buffer.ByteBuf;
+import org.redisson.api.*;
+import org.redisson.client.RedisClient;
 import org.redisson.client.codec.Codec;
 import org.redisson.client.codec.LongCodec;
-import org.redisson.client.codec.ScanCodec;
 import org.redisson.client.codec.StringCodec;
 import org.redisson.client.protocol.RedisCommand;
 import org.redisson.client.protocol.RedisCommands;
 import org.redisson.client.protocol.decoder.MapScanResult;
-import org.redisson.client.protocol.decoder.ScanObjectEntry;
+import org.redisson.codec.CompositeCodec;
 import org.redisson.command.CommandAsyncExecutor;
+import org.redisson.iterator.RedissonBaseMapIterator;
+import org.redisson.misc.CompletableFutureWrapper;
 import org.redisson.misc.Hash;
+
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.TimeUnit;
 
 /**
  * @author Nikita Koksharov
@@ -49,26 +43,99 @@ import org.redisson.misc.Hash;
  */
 public abstract class RedissonMultimap<K, V> extends RedissonExpirable implements RMultimap<K, V> {
 
-    RedissonMultimap(CommandAsyncExecutor connectionManager, String name) {
-        super(connectionManager, name);
+    final String prefix;
+    
+    RedissonMultimap(CommandAsyncExecutor commandAsyncExecutor, String name) {
+        super(commandAsyncExecutor, name);
+        prefix = suffixName(getRawName(), "");
     }
 
-    RedissonMultimap(Codec codec, CommandAsyncExecutor connectionManager, String name) {
-        super(codec, connectionManager, name);
+    RedissonMultimap(Codec codec, CommandAsyncExecutor commandAsyncExecutor, String name) {
+        super(codec, commandAsyncExecutor, name);
+        prefix = suffixName(getRawName(), "");
     }
 
-    protected String hash(byte[] objectState) {
-        return Hash.hashToBase64(objectState);
+    @Override
+    public RFuture<Long> sizeInMemoryAsync() {
+        return commandExecutor.evalWriteAsync(getRawName(), StringCodec.INSTANCE, RedisCommands.EVAL_LONG,
+                "local keys = redis.call('hgetall', KEYS[1]); " +
+                "local size = 0; " +
+                "for i, v in ipairs(keys) do " +
+                    "if i % 2 == 0 then " +
+                        "local name = ARGV[1] .. v; " +
+                        "size = size + redis.call('memory', 'usage', name); " +
+                    "end;" +
+                "end; " +
+                "return size; ", Arrays.asList(getRawName()), prefix);
     }
 
+    @Override
+    public RFuture<Boolean> copyAsync(List<Object> keys, int database, boolean replace) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public RLock getFairLock(K key) {
+        String lockName = getLockByMapKey(key, "fairlock");
+        return new RedissonFairLock(commandExecutor, lockName);
+    }
+    
+    @Override
+    public RPermitExpirableSemaphore getPermitExpirableSemaphore(K key) {
+        String lockName = getLockByMapKey(key, "permitexpirablesemaphore");
+        return new RedissonPermitExpirableSemaphore(commandExecutor, lockName);
+    }
+    
+    @Override
+    public RCountDownLatch getCountDownLatch(K key) {
+        String lockName = getLockByMapKey(key, "countdownlatch");
+        return new RedissonCountDownLatch(commandExecutor, lockName);
+    }
+    
+    @Override
+    public RSemaphore getSemaphore(K key) {
+        String lockName = getLockByMapKey(key, "semaphore");
+        return new RedissonSemaphore(commandExecutor, lockName);
+    }
+    
+    @Override
+    public RLock getLock(K key) {
+        String lockName = getLockByMapKey(key, "lock");
+        return new RedissonLock(commandExecutor, lockName);
+    }
+    
+    @Override
+    public RReadWriteLock getReadWriteLock(K key) {
+        String lockName = getLockByMapKey(key, "rw_lock");
+        return new RedissonReadWriteLock(commandExecutor, lockName);
+    }
+    
+    String hash(ByteBuf objectState) {
+        return Hash.hash128toBase64(objectState);
+    }
+
+    protected String keyHash(Object key) {
+        ByteBuf objectState = encodeMapKey(key);
+        try {
+            return Hash.hash128toBase64(objectState);
+        } finally {
+            objectState.release();
+        }
+    }
+    
     @Override
     public int size() {
         return get(sizeAsync());
     }
-    
+
+    @Override
+    public long fastRemoveValue(V... values) {
+        return get(fastRemoveValueAsync(values));
+    }
+
     @Override
     public int keySize() {
-    	return get(keySizeAsync());
+        return get(keySizeAsync());
     }
 
     @Override
@@ -97,7 +164,7 @@ public abstract class RedissonMultimap<K, V> extends RedissonExpirable implement
     }
 
     String getValuesName(String hash) {
-        return "{" + getName() + "}:" + hash;
+        return suffixName(getRawName(), hash);
     }
 
     @Override
@@ -146,21 +213,31 @@ public abstract class RedissonMultimap<K, V> extends RedissonExpirable implement
     }
 
     @Override
-    public long fastRemove(K ... keys) {
+    public Set<K> readAllKeySet() {
+        return get(readAllKeySetAsync());
+    }
+
+    @Override
+    public RFuture<Set<K>> readAllKeySetAsync() {
+        return commandExecutor.readAsync(getRawName(), codec, RedisCommands.HKEYS, getRawName());
+    }
+
+    @Override
+    public long fastRemove(K... keys) {
         return get(fastRemoveAsync(keys));
     }
 
     @Override
-    public RFuture<Long> fastRemoveAsync(K ... keys) {
+    public RFuture<Long> fastRemoveAsync(K... keys) {
         if (keys == null || keys.length == 0) {
-            return newSucceededFuture(0L);
+            return new CompletableFutureWrapper<>(0L);
         }
 
         List<Object> mapKeys = new ArrayList<Object>(keys.length);
         List<Object> listKeys = new ArrayList<Object>(keys.length + 1);
-        listKeys.add(getName());
+        listKeys.add(getRawName());
         for (K key : keys) {
-            byte[] keyState = encodeMapKey(key);
+            ByteBuf keyState = encodeMapKey(key);
             mapKeys.add(keyState);
             String keyHash = hash(keyState);
             String name = getValuesName(keyHash);
@@ -171,7 +248,7 @@ public abstract class RedissonMultimap<K, V> extends RedissonExpirable implement
     }
 
     protected <T> RFuture<T> fastRemoveAsync(List<Object> mapKeys, List<Object> listKeys, RedisCommand<T> evalCommandType) {
-        return commandExecutor.evalWriteAsync(getName(), codec, evalCommandType,
+        return commandExecutor.evalWriteAsync(getRawName(), codec, evalCommandType,
                     "local res = redis.call('hdel', KEYS[1], unpack(ARGV)); " +
                     "if res > 0 then " +
                         "redis.call('del', unpack(KEYS, 2, #KEYS)); " +
@@ -182,12 +259,12 @@ public abstract class RedissonMultimap<K, V> extends RedissonExpirable implement
     
     @Override
     public RFuture<Boolean> deleteAsync() {
-        return commandExecutor.evalWriteAsync(getName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN_AMOUNT,
+        return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN_AMOUNT,
                 "local entries = redis.call('hgetall', KEYS[1]); " +
                 "local keys = {KEYS[1]}; " +
                 "for i, v in ipairs(entries) do " +
                     "if i % 2 == 0 then " +
-                        "local name = '{' .. KEYS[1] .. '}:' .. v; " + 
+                        "local name = ARGV[1] .. v; " + 
                         "table.insert(keys, name); " +
                     "end;" +
                 "end; " +
@@ -197,59 +274,135 @@ public abstract class RedissonMultimap<K, V> extends RedissonExpirable implement
                     + "n = n + redis.call('del', unpack(keys, i, math.min(i+4999, table.getn(keys)))) "
                 + "end; "
                 + "return n;",
-                Arrays.<Object>asList(getName()));
+                Arrays.<Object>asList(getRawName()), prefix);
     }
 
     @Override
-    public RFuture<Boolean> expireAsync(long timeToLive, TimeUnit timeUnit) {
-        return commandExecutor.evalWriteAsync(getName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+    public RFuture<Void> renameAsync(String newName) {
+        String newPrefix = suffixName(newName, "");
+        RFuture<Void> future = commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_VOID,
                 "local entries = redis.call('hgetall', KEYS[1]); " +
+                "local keys = {}; " +
                 "for i, v in ipairs(entries) do " +
                     "if i % 2 == 0 then " +
-                        "local name = '{' .. KEYS[1] .. '}:' .. v; " + 
-                        "redis.call('pexpire', name, ARGV[1]); " +
+                        "table.insert(keys, v); " +
                     "end;" +
                 "end; " +
-                "return redis.call('pexpire', KEYS[1], ARGV[1]); ",
-                Arrays.<Object>asList(getName()), timeUnit.toMillis(timeToLive));
+
+                "redis.call('rename', KEYS[1], ARGV[3]); "
+              + "for i=1, #keys, 1 do "
+                  + "redis.call('rename', ARGV[1] .. keys[i], ARGV[2] .. keys[i]); "
+              + "end; ",
+                Arrays.asList(getRawName()), prefix, newPrefix, newName);
+        CompletionStage<Void> f = future.thenAccept(r -> setName(newName));
+        return new CompletableFutureWrapper<>(f);
     }
 
     @Override
-    public RFuture<Boolean> expireAtAsync(long timestamp) {
-        return commandExecutor.evalWriteAsync(getName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+    public RFuture<Boolean> renamenxAsync(String newName) {
+        String newPrefix = suffixName(newName, "");
+        RFuture<Boolean> future = commandExecutor.evalWriteAsync(getRawName(), StringCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+                "local entries = redis.call('hgetall', KEYS[1]); " +
+                "local keys = {}; " +
+                "for i, v in ipairs(entries) do " +
+                    "if i % 2 == 0 then " +
+                        "table.insert(keys, v); " +
+                    "end;" +
+                "end; " +
+
+                "local r = redis.call('exists', ARGV[3]);" +
+                "if r == 1 then " +
+                    "return 0;" +
+                "end; " +
+                "for i=1, #keys, 1 do " +
+                    "local r = redis.call('exists', ARGV[2] .. keys[i]);" +
+                    "if r == 1 then " +
+                        "return 0;" +
+                    "end; " +
+                "end; " +
+
+                "redis.call('rename', KEYS[1], ARGV[3]); "
+              + "for i=1, #keys, 1 do "
+                  + "redis.call('rename', ARGV[1] .. keys[i], ARGV[2] .. keys[i]); "
+              + "end; " +
+                "return 1; ",
+                Arrays.asList(getRawName()), prefix, newPrefix, newName);
+        CompletionStage<Boolean> f = future.thenApply(value -> {
+            if (value) {
+                setName(newName);
+            }
+            return value;
+        });
+        return new CompletableFutureWrapper<>(f);
+    }
+
+    @Override
+    public RFuture<Boolean> expireAsync(long timeToLive, TimeUnit timeUnit, String param, String... keys) {
+        return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 "local entries = redis.call('hgetall', KEYS[1]); " +
                 "for i, v in ipairs(entries) do " +
                     "if i % 2 == 0 then " +
-                        "local name = '{' .. KEYS[1] .. '}:' .. v; " + 
-                        "redis.call('pexpireat', name, ARGV[1]); " +
-                    "end;" +
-                "end; " +
-                "return redis.call('pexpireat', KEYS[1], ARGV[1]); ",
-                Arrays.<Object>asList(getName()), timestamp);
+                        "local name = ARGV[2] .. v; "
+                      + "if ARGV[3] ~= '' then "
+                          + "redis.call('pexpire', name, ARGV[1], ARGV[3]); "
+                      + "else "
+                          + "redis.call('pexpire', name, ARGV[1]); "
+                      + "end; "
+                  + "end;" +
+                "end; "
+              + "if ARGV[3] ~= '' then "
+                  + "return redis.call('pexpire', KEYS[1], ARGV[1], ARGV[3]); "
+              + "end; "
+              + "return redis.call('pexpire', KEYS[1], ARGV[1]); ",
+                Arrays.asList(getRawName()),
+                timeUnit.toMillis(timeToLive), prefix, param);
+    }
+
+    @Override
+    protected RFuture<Boolean> expireAtAsync(long timestamp, String param, String... keys) {
+        return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+          "local entries = redis.call('hgetall', KEYS[1]); " +
+                "for i, v in ipairs(entries) do " +
+                    "if i % 2 == 0 then " +
+                        "local name = ARGV[2] .. v; "
+                      + "if ARGV[3] ~= '' then "
+                          + "redis.call('pexpireat', name, ARGV[1], ARGV[3]); "
+                      + "else "
+                          + "redis.call('pexpireat', name, ARGV[1]); "
+                      + "end; "
+                  + "end;"
+              + "end; "
+              + "if ARGV[3] ~= '' then "
+                  + "return redis.call('pexpireat', KEYS[1], ARGV[1], ARGV[3]); "
+              + "end; "
+              + "return redis.call('pexpireat', KEYS[1], ARGV[1]); ",
+                Arrays.asList(getRawName()),
+                timestamp, prefix, param);
     }
 
     @Override
     public RFuture<Boolean> clearExpireAsync() {
-        return commandExecutor.evalWriteAsync(getName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+        return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 "local entries = redis.call('hgetall', KEYS[1]); " +
                 "for i, v in ipairs(entries) do " +
                     "if i % 2 == 0 then " +
-                        "local name = '{' .. KEYS[1] .. '}:' .. v; " + 
+                        "local name = ARGV[1] .. v; " + 
                         "redis.call('persist', name); " +
                     "end;" +
                 "end; " +
                 "return redis.call('persist', KEYS[1]); ",
-                Arrays.<Object>asList(getName()));
+                Arrays.<Object>asList(getRawName()),
+                prefix);
     }
     
     @Override
     public RFuture<Integer> keySizeAsync() {
-    	return commandExecutor.readAsync(getName(), LongCodec.INSTANCE, RedisCommands.HLEN, getName());
+        return commandExecutor.readAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.HLEN, getRawName());
     }
     
     
-    MapScanResult<ScanObjectEntry, ScanObjectEntry> scanIterator(InetSocketAddress client, long startPos) {
-        RFuture<MapScanResult<ScanObjectEntry, ScanObjectEntry>> f = commandExecutor.readAsync(client, getName(), new ScanCodec(codec, StringCodec.INSTANCE), RedisCommands.HSCAN, getName(), startPos);
+    MapScanResult<Object, Object> scanIterator(RedisClient client, String startPos) {
+        RFuture<MapScanResult<Object, Object>> f = commandExecutor.readAsync(client, getRawName(), new CompositeCodec(codec, StringCodec.INSTANCE, codec), RedisCommands.HSCAN, getRawName(), startPos);
         return get(f);
     }
 
@@ -261,11 +414,28 @@ public abstract class RedissonMultimap<K, V> extends RedissonExpirable implement
 
         @Override
         public Iterator<K> iterator() {
-            return new RedissonMultiMapKeysIterator<K, V, K>(RedissonMultimap.this) {
+            return new RedissonBaseMapIterator<K>() {
                 @Override
-                K getValue(java.util.Map.Entry<ScanObjectEntry, ScanObjectEntry> entry) {
-                    return (K) entry.getKey().getObj();
+                protected K getValue(java.util.Map.Entry<Object, Object> entry) {
+                    return (K) entry.getKey();
                 }
+
+                @Override
+                protected Object put(Entry<Object, Object> entry, Object value) {
+                    return RedissonMultimap.this.put((K) entry.getKey(), (V) value);
+                }
+
+                @Override
+                protected ScanResult<Entry<Object, Object>> iterator(RedisClient client, String nextIterPos) {
+                    return RedissonMultimap.this.scanIterator(client, nextIterPos);
+                }
+
+                @Override
+                protected void remove(Entry<Object, Object> value) {
+                    RedissonMultimap.this.fastRemove((K) value.getKey());
+                }
+
+
             };
         }
 
@@ -276,7 +446,7 @@ public abstract class RedissonMultimap<K, V> extends RedissonExpirable implement
 
         @Override
         public boolean remove(Object o) {
-            return RedissonMultimap.this.fastRemove((K)o) == 1;
+            return RedissonMultimap.this.fastRemove((K) o) == 1;
         }
 
         @Override
@@ -315,22 +485,25 @@ public abstract class RedissonMultimap<K, V> extends RedissonExpirable implement
 
     }
 
-    final class EntrySet extends AbstractSet<Map.Entry<K,V>> {
+    final class EntrySet extends AbstractSet<Map.Entry<K, V>> {
 
-        public final Iterator<Map.Entry<K,V>> iterator() {
+        @Override
+        public Iterator<Map.Entry<K, V>> iterator() {
             return entryIterator();
         }
 
-        public final boolean contains(Object o) {
+        @Override
+        public boolean contains(Object o) {
             if (!(o instanceof Map.Entry))
                 return false;
-            Map.Entry<?,?> e = (Map.Entry<?,?>) o;
+            Map.Entry<?, ?> e = (Map.Entry<?, ?>) o;
             return containsEntry(e.getKey(), e.getValue());
         }
 
-        public final boolean remove(Object o) {
+        @Override
+        public boolean remove(Object o) {
             if (o instanceof Map.Entry) {
-                Map.Entry<?,?> e = (Map.Entry<?,?>) o;
+                Map.Entry<?, ?> e = (Map.Entry<?, ?>) o;
                 Object key = e.getKey();
                 Object value = e.getValue();
                 return RedissonMultimap.this.remove(key, value);
@@ -338,11 +511,13 @@ public abstract class RedissonMultimap<K, V> extends RedissonExpirable implement
             return false;
         }
 
-        public final int size() {
+        @Override
+        public int size() {
             return RedissonMultimap.this.size();
         }
 
-        public final void clear() {
+        @Override
+        public void clear() {
             RedissonMultimap.this.clear();
         }
 

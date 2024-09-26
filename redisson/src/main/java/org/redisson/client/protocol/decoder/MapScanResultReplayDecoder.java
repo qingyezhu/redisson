@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,29 +15,29 @@
  */
 package org.redisson.client.protocol.decoder;
 
+import org.redisson.client.codec.Codec;
+import org.redisson.client.codec.StringCodec;
+import org.redisson.client.handler.State;
+import org.redisson.client.protocol.Decoder;
+
 import java.util.List;
 import java.util.Map;
 
-import org.redisson.client.handler.State;
-
-import io.netty.buffer.ByteBuf;
-import io.netty.util.CharsetUtil;
-
+/**
+ * 
+ * @author Nikita Koksharov
+ *
+ */
 public class MapScanResultReplayDecoder implements MultiDecoder<MapScanResult<Object, Object>> {
 
     @Override
-    public Object decode(ByteBuf buf, State state) {
-        return Long.valueOf(buf.toString(CharsetUtil.UTF_8));
+    public Decoder<Object> getDecoder(Codec codec, int paramNum, State state, long size) {
+        return StringCodec.INSTANCE.getValueDecoder();
     }
-
+    
     @Override
     public MapScanResult<Object, Object> decode(List<Object> parts, State state) {
-        return new MapScanResult<Object, Object>((Long)parts.get(0), (Map<Object, Object>)parts.get(1));
-    }
-
-    @Override
-    public boolean isApplicable(int paramNum, State state) {
-        return paramNum == 0;
+        return new MapScanResult<>((String) parts.get(0), (Map<Object, Object>) parts.get(1));
     }
 
 }

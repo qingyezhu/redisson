@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,27 +15,20 @@
  */
 package org.redisson.client.protocol.decoder;
 
-import java.util.List;
-
 import org.redisson.client.handler.State;
 
-import io.netty.buffer.ByteBuf;
+import java.util.List;
 
+/**
+ * 
+ * @author Nikita Koksharov
+ *
+ */
 public class ListIteratorReplayDecoder implements MultiDecoder<ListIteratorResult<Object>> {
 
     @Override
-    public Object decode(ByteBuf buf, State state) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
     public ListIteratorResult<Object> decode(List<Object> parts, State state) {
-        return new ListIteratorResult<Object>(parts.get(0), Long.valueOf(parts.get(1).toString()));
-    }
-
-    @Override
-    public boolean isApplicable(int paramNum, State state) {
-        return false;
+        return new ListIteratorResult<>(parts.get(0), Long.valueOf(parts.get(1).toString()));
     }
 
 }

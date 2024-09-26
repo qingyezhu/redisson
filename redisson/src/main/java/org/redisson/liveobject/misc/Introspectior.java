@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,18 @@
 package org.redisson.liveobject.misc;
 
 import java.lang.annotation.Annotation;
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
 import net.bytebuddy.description.field.FieldDescription;
 import net.bytebuddy.description.field.FieldList;
-import net.bytebuddy.description.method.MethodDescription;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.matcher.ElementMatchers;
+import org.redisson.api.annotation.RId;
+import org.redisson.cache.LRUCacheMap;
 
 /**
  *
@@ -32,35 +39,32 @@ public class Introspectior {
         return new TypeDescription.ForLoadedType(c);
     }
 
-    public static MethodDescription getMethodDescription(Class<?> c, String method) {
-        if (method == null || method.isEmpty()) {
-            return null;
-        }
-        return getTypeDescription(c)
-                .getDeclaredMethods()
-                .filter(ElementMatchers.hasMethodName(method))
-                .getOnly();
-    }
-
-    public static FieldList<FieldDescription.InDefinedShape> getFieldsDescription(Class<?> c) {
-        return getTypeDescription(c)
-                .getDeclaredFields();
-                
-    }
-    
-    public static FieldDescription getFieldDescription(Class<?> c, String field) {
-        if (field == null || field.isEmpty()) {
-            return null;
-        }
-        return getTypeDescription(c)
-                .getDeclaredFields()
-                .filter(ElementMatchers.named(field))
-                .getOnly();
-    }
-
     public static FieldList<FieldDescription.InDefinedShape> getFieldsWithAnnotation(Class<?> c, Class<? extends Annotation> a) {
-        return getTypeDescription(c)
-                .getDeclaredFields()
+        return getAllFields(c)
                 .filter(ElementMatchers.isAnnotatedWith(a));
     }
+
+    public static FieldList<FieldDescription.InDefinedShape> getAllFields(Class<?> cls) {
+        List<Field> fields = new ArrayList<Field>();
+        for (Class<?> c = cls; c != null; c = c.getSuperclass()) {
+            Collections.addAll(fields, c.getDeclaredFields());
+        }
+        return new FieldList.ForLoadedFields(fields);
+    }
+
+
+    private static final Map<Class<?>, String> ID_FIELD_NAME_CACHE = new LRUCacheMap<>(500, 0, 0);
+
+    public static String getREntityIdFieldName(Class<?> cls) {
+        String name = ID_FIELD_NAME_CACHE.get(cls);
+        if (name == null) {
+            name = Introspectior
+                    .getFieldsWithAnnotation(cls, RId.class)
+                    .getOnly()
+                    .getName();
+            ID_FIELD_NAME_CACHE.put(cls, name);
+        }
+        return name;
+    }
+
 }

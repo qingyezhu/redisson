@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,19 +15,16 @@
  */
 package org.redisson.api;
 
-import java.util.List;
-
 import org.redisson.client.RedisException;
 import org.redisson.client.codec.Codec;
+import org.redisson.codec.JsonCodec;
 
 /**
- * Interface for using pipeline feature.
+ * Interface for using Redis pipeline feature.
  * <p>
- * All method invocations on objects
- * from this interface are batched to separate queue and could be executed later
+ * All method invocations on objects got through this interface 
+ * are batched to separate queue and could be executed later
  * with <code>execute()</code> or <code>executeAsync()</code> methods.
- * <p>
- * Please be ware, atomicity <b>is not</b> guaranteed.
  *
  *
  * @author Nikita Koksharov
@@ -35,6 +32,28 @@ import org.redisson.client.codec.Codec;
  */
 public interface RBatch {
 
+    /**
+     * Returns stream instance by <code>name</code>
+     * 
+     * @param <K> type of key
+     * @param <V> type of value
+     * @param name of stream
+     * @return RStream object
+     */
+    <K, V> RStreamAsync<K, V> getStream(String name);
+    
+    /**
+     * Returns stream instance by <code>name</code>
+     * using provided <code>codec</code> for entries.
+     * 
+     * @param <K> type of key
+     * @param <V> type of value
+     * @param name - name of stream
+     * @param codec - codec for entry
+     * @return RStream object
+     */
+    <K, V> RStreamAsync<K, V> getStream(String name, Codec codec);
+    
     /**
      * Returns geospatial items holder instance by <code>name</code>.
      * 
@@ -162,6 +181,34 @@ public interface RBatch {
     <K, V> RMapCacheAsync<K, V> getMapCache(String name);
 
     /**
+     * Returns map instance by name.
+     * Supports entry eviction with a given TTL.
+     * <p>
+     * Requires <b>Redis 7.4.0 and higher.</b>
+     *
+     * @param <K> type of key
+     * @param <V> type of value
+     * @param name name of object
+     * @return Map object
+     */
+    <K, V> RMapCacheNativeAsync<K, V> getMapCacheNative(String name);
+
+    /**
+     * Returns map instance by name
+     * using provided codec for both map keys and values.
+     * Supports entry eviction with a given TTL.
+     * <p>
+     * Requires <b>Redis 7.4.0 and higher.</b>
+     *
+     * @param <K> type of key
+     * @param <V> type of value
+     * @param name name of object
+     * @param codec codec for keys and values
+     * @return Map object
+     */
+    <K, V> RMapCacheNativeAsync<K, V> getMapCacheNative(String name, Codec codec);
+
+    /**
      * Returns object holder by <code>name</code>
      *
      * @param <V> type of object
@@ -171,6 +218,18 @@ public interface RBatch {
     <V> RBucketAsync<V> getBucket(String name);
 
     <V> RBucketAsync<V> getBucket(String name, Codec codec);
+
+    /**
+     * Returns JSON data holder instance by name using provided codec.
+     *
+     * @see org.redisson.codec.JacksonCodec
+     *
+     * @param <V> type of value
+     * @param name name of object
+     * @param codec codec for values
+     * @return JsonBucket object
+     */
+    <V> RJsonBucketAsync<V> getJsonBucket(String name, JsonCodec codec);
 
     /**
      * Returns HyperLogLog object
@@ -227,7 +286,7 @@ public interface RBatch {
      * @param name - name of object
      * @return ListMultimapCache object
      */
-    <K, V> RMultimapAsync<K, V> getListMultimapCache(String name);
+    <K, V> RMultimapCacheAsync<K, V> getListMultimapCache(String name);
     
     /**
      * Returns List based Multimap instance by name
@@ -242,8 +301,76 @@ public interface RBatch {
      * @param codec - codec for keys and values
      * @return ListMultimapCache object
      */
-    <K, V> RMultimapAsync<K, V> getListMultimapCache(String name, Codec codec);
-    
+    <K, V> RMultimapCacheAsync<K, V> getListMultimapCache(String name, Codec codec);
+
+    /**
+     * Returns List based Multimap instance by name.
+     * Supports key-entry eviction with a given TTL value.
+     * Stores insertion order and allows duplicates for values mapped to key.
+     * <p>
+     * Uses Redis native commands for entry expiration and not a scheduled eviction task.
+     * <p>
+     * Requires <b>Redis 7.4.0 and higher.</b>
+     *
+     * @param <K> type of key
+     * @param <V> type of value
+     * @param name name of object
+     * @return ListMultimapCache object
+     */
+    <K, V> RMultimapCacheAsync<K, V> getListMultimapCacheNative(String name);
+
+    /**
+     * Returns List based Multimap instance by name
+     * using provided codec for both map keys and values.
+     * Supports key-entry eviction with a given TTL value.
+     * Stores insertion order and allows duplicates for values mapped to key.
+     * <p>
+     * Uses Redis native commands for entry expiration and not a scheduled eviction task.
+     * <p>
+     * Requires <b>Redis 7.4.0 and higher.</b>
+     *
+     * @param <K> type of key
+     * @param <V> type of value
+     * @param name name of object
+     * @param codec codec for keys and values
+     * @return ListMultimapCache object
+     */
+    <K, V> RMultimapCacheAsync<K, V> getListMultimapCacheNative(String name, Codec codec);
+
+    /**
+     * Returns Set based Multimap instance by name.
+     * Supports key-entry eviction with a given TTL value.
+     * Doesn't allow duplications for values mapped to key.
+     * <p>
+     * Uses Redis native commands for entry expiration and not a scheduled eviction task.
+     * <p>
+     * Requires <b>Redis 7.4.0 and higher.</b>
+     *
+     * @param <K> type of key
+     * @param <V> type of value
+     * @param name name of object
+     * @return SetMultimapCache object
+     */
+    <K, V> RMultimapCacheAsync<K, V> getSetMultimapCacheNative(String name);
+
+    /**
+     * Returns Set based Multimap instance by name
+     * using provided codec for both map keys and values.
+     * Supports key-entry eviction with a given TTL value.
+     * Doesn't allow duplications for values mapped to key.
+     * <p>
+     * Uses Redis native commands for entry expiration and not a scheduled eviction task.
+     * <p>
+     * Requires <b>Redis 7.4.0 and higher.</b>
+     *
+     * @param <K> type of key
+     * @param <V> type of value
+     * @param name name of object
+     * @param codec codec for keys and values
+     * @return SetMultimapCache object
+     */
+    <K, V> RMultimapCacheAsync<K, V> getSetMultimapCacheNative(String name, Codec codec);
+
     /**
      * Returns map instance by name.
      *
@@ -270,13 +397,35 @@ public interface RBatch {
     /**
      * Returns topic instance by name.
      *
-     * @param <M> type of message
      * @param name - name of object
      * @return Topic object
      */
-    <M> RTopicAsync<M> getTopic(String name);
+    RTopicAsync getTopic(String name);
 
-    <M> RTopicAsync<M> getTopic(String name, Codec codec);
+    RTopicAsync getTopic(String name, Codec codec);
+
+    /**
+     * Returns Sharded Topic instance by name.
+     * <p>
+     * Messages are delivered to message listeners connected to the same Topic.
+     * <p>
+     *
+     * @param name - name of object
+     * @return Topic object
+     */
+    RShardedTopicAsync getShardedTopic(String name);
+
+    /**
+     * Returns Sharded Topic instance by name using provided codec for messages.
+     * <p>
+     * Messages are delivered to message listeners connected to the same Topic.
+     * <p>
+     *
+     * @param name - name of object
+     * @param codec - codec for message
+     * @return Topic object
+     */
+    RShardedTopicAsync getShardedTopic(String name, Codec codec);
 
     /**
      * Returns queue instance by name.
@@ -359,6 +508,12 @@ public interface RBatch {
      */
     RLexSortedSetAsync getLexSortedSet(String name);
 
+    /**
+     * Returns bitSet instance by name.
+     *
+     * @param name - name of object
+     * @return BitSet object
+     */
     RBitSetAsync getBitSet(String name);
 
     /**
@@ -367,6 +522,29 @@ public interface RBatch {
      * @return Script object
      */
     RScriptAsync getScript();
+
+    /**
+     * Returns script operations object using provided codec.
+     * 
+     * @param codec - codec for params and result
+     * @return Script object
+     */
+    RScriptAsync getScript(Codec codec);
+
+    /**
+     * Returns interface for Redis Function feature
+     *
+     * @return function object
+     */
+    RFunctionAsync getFunction();
+
+    /**
+     * Returns interface for Redis Function feature using provided codec
+     *
+     * @param codec - codec for params and result
+     * @return function interface
+     */
+    RFunctionAsync getFunction(Codec codec);
 
     /**
      * Returns keys operations.
@@ -386,7 +564,7 @@ public interface RBatch {
      * @throws RedisException in case of any error
      *
      */
-    List<?> execute() throws RedisException;
+    BatchResult<?> execute() throws RedisException;
 
     /**
      * Executes all operations accumulated during async methods invocations asynchronously.
@@ -396,30 +574,19 @@ public interface RBatch {
      *
      * @return List with result object for each command
      */
-    RFuture<List<?>> executeAsync();
+    RFuture<BatchResult<?>> executeAsync();
 
     /**
-     * Executes all operations accumulated during async methods invocations. 
-     * Command replies are skipped such approach saves response bandwidth.
-     * <p>
-     * If cluster configuration used then operations are grouped by slot ids
-     * and may be executed on different servers. Thus command execution order could be changed
-     *
-     * @throws RedisException in case of any error
-     *
+     * Discard batched commands and release allocated buffers used for parameters encoding.
      */
-    void executeSkipResult();
+    void discard();
 
     /**
-     * Executes all operations accumulated during async methods invocations asynchronously, 
-     * Command replies are skipped such approach saves response bandwidth.
-     * <p>
-     * If cluster configuration used then operations are grouped by slot ids
-     * and may be executed on different servers. Thus command execution order could be changed
-     * 
+     * Discard batched commands and release allocated buffers used for parameters encoding.
+     *
      * @return void
-     * @throws RedisException in case of any error
-     *
      */
-    RFuture<Void> executeSkipResultAsync();
+    RFuture<Void> discardAsync();
+
+
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,14 +15,17 @@
  */
 package org.redisson.client.protocol;
 
+import org.redisson.client.RedisException;
+import org.redisson.client.RedisRedirectException;
+import org.redisson.client.RedisRetryException;
+import org.redisson.client.codec.Codec;
+import org.redisson.client.codec.StringCodec;
+
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
-import org.redisson.client.RedisRedirectException;
-import org.redisson.client.codec.Codec;
-import org.redisson.misc.RPromise;
-
 /**
- * 
+ *
  * @author Nikita Koksharov
  *
  * @param <T> input type
@@ -31,40 +34,44 @@ import org.redisson.misc.RPromise;
 public class BatchCommandData<T, R> extends CommandData<T, R> implements Comparable<BatchCommandData<T, R>> {
 
     private final int index;
-    private final AtomicReference<RedisRedirectException> redirectError = new AtomicReference<RedisRedirectException>();
-    
-    public BatchCommandData(RPromise<R> promise, Codec codec, RedisCommand<T> command, Object[] params, int index) {
+    private final AtomicReference<RedisException> retryError = new AtomicReference<>();
+
+    public BatchCommandData(RedisCommand<T> command, Object[] params, int index) {
+        this(new CompletableFuture<>(), StringCodec.INSTANCE, command, params, index);
+    }
+
+    public BatchCommandData(CompletableFuture<R> promise, Codec codec, RedisCommand<T> command, Object[] params, int index) {
         super(promise, codec, command, params);
         this.index = index;
     }
-    
+
     @Override
     public boolean tryFailure(Throwable cause) {
-        if (redirectError.get() != null) {
+        if (retryError.get() != null) {
             return false;
         }
-        if (cause instanceof RedisRedirectException) {
-            return redirectError.compareAndSet(null, (RedisRedirectException) cause);
+        if (cause instanceof RedisRedirectException || cause instanceof RedisRetryException) {
+            return retryError.compareAndSet(null, (RedisException) cause);
         }
 
         return super.tryFailure(cause);
     }
-    
+
     @Override
     public boolean isSuccess() {
-        return redirectError.get() == null && super.isSuccess();
+        return retryError.get() == null && super.isSuccess();
     }
-    
+
     @Override
     public Throwable cause() {
-        if (redirectError.get() != null) {
-            return redirectError.get();
+        if (retryError.get() != null) {
+            return retryError.get();
         }
         return super.cause();
     }
-    
+
     public void clearError() {
-        redirectError.set(null);
+        retryError.set(null);
     }
 
     @Override
@@ -72,4 +79,11 @@ public class BatchCommandData<T, R> extends CommandData<T, R> implements Compara
         return index - o.index;
     }
 
+    public void updateCommand(RedisCommand command) {
+        this.command = command;
+    }
+
+    public int getIndex() {
+        return index;
+    }
 }

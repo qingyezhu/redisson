@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,16 @@
  */
 package org.redisson.config;
 
+/**
+ * 
+ * @author Nikita Koksharov
+ *
+ */
 public enum ReadMode {
 
     /**
-     * Read from slave nodes
+     * Read from slave nodes. Uses MASTER if no SLAVES are available.
+     * Node is selected using specified <code>loadBalancer</code> in Redisson configuration.
      */
     SLAVE,
 
@@ -28,7 +34,8 @@ public enum ReadMode {
     MASTER,
 
     /**
-     * Read from master and slave nodes
+     * Read from master and slave nodes.
+     * Node is selected using specified <code>loadBalancer</code> in Redisson configuration.
      */
     MASTER_SLAVE,
 

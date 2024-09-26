@@ -1,116 +1,189 @@
 package org.redisson;
 
-import static org.assertj.core.api.Assertions.assertThat;
-
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-
-import org.junit.After;
-import org.junit.AfterClass;
-import org.junit.Before;
-import org.junit.BeforeClass;
-import org.junit.Test;
-import org.redisson.api.RFuture;
-import org.redisson.client.RedisClient;
-import org.redisson.client.RedisConnection;
-import org.redisson.client.RedisPubSubConnection;
-import org.redisson.client.RedisPubSubListener;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.redisson.client.*;
 import org.redisson.client.codec.LongCodec;
 import org.redisson.client.codec.StringCodec;
 import org.redisson.client.protocol.CommandData;
 import org.redisson.client.protocol.CommandsData;
 import org.redisson.client.protocol.RedisCommands;
+import org.redisson.client.protocol.RedisStrictCommand;
 import org.redisson.client.protocol.pubsub.PubSubType;
-import org.redisson.misc.RPromise;
-import org.redisson.misc.RedissonPromise;
+import org.redisson.config.Protocol;
 
-import io.netty.util.concurrent.FutureListener;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
-public class RedisClientTest {
+import static org.assertj.core.api.Assertions.assertThat;
 
-    @BeforeClass
-    public static void beforeClass() throws IOException, InterruptedException {
-        if (!RedissonRuntimeEnvironment.isTravis) {
-            RedisRunner.startDefaultRedisServerInstance();
-        }
+public class RedisClientTest  {
+
+    private static RedisClient redisClient;
+    
+    @BeforeAll
+    public static void beforeAll() {
+        RedisClientConfig config = new RedisClientConfig();
+        config.setProtocol(Protocol.RESP3);
+        config.setAddress("redis://127.0.0.1:" + RedisDockerTest.REDIS.getFirstMappedPort());
+        redisClient = RedisClient.create(config);
     }
 
-    @AfterClass
-    public static void afterClass() throws IOException, InterruptedException {
-        if (!RedissonRuntimeEnvironment.isTravis) {
-            RedisRunner.shutDownDefaultRedisServerInstance();
-        }
-    }
-
-    @Before
-    public void before() throws IOException, InterruptedException {
-        if (RedissonRuntimeEnvironment.isTravis) {
-            RedisRunner.startDefaultRedisServerInstance();
-        }
-    }
-
-    @After
-    public void after() throws InterruptedException {
-        if (RedissonRuntimeEnvironment.isTravis) {
-            RedisRunner.shutDownDefaultRedisServerInstance();
-        }
+    @AfterAll
+    public static void afterAll() {
+        redisClient.shutdown();
     }
 
     @Test
-    public void testConnectAsync() throws InterruptedException {
-        RedisClient c = new RedisClient(RedisRunner.getDefaultRedisServerBindAddressAndPort());
-        RFuture<RedisConnection> f = c.connectAsync();
-        final CountDownLatch l = new CountDownLatch(1);
-        f.addListener((FutureListener<RedisConnection>) future -> {
-            RedisConnection conn = future.get();
+    public void testUsername() {
+        RedisClientConfig cc = redisClient.getConfig();
+
+        RedisConnection c = redisClient.connect();
+        c.sync(new RedisStrictCommand<Void>("ACL"), "SETUSER", "testuser", "on", ">123456", "~*", "allcommands");
+        c.close();
+
+        cc.setUsername("testuser");
+        cc.setPassword("123456");
+        RedisClient client = RedisClient.create(cc);
+        RedisConnection c2 = client.connect();
+        assertThat(c2.sync(RedisCommands.PING)).isEqualTo("PONG");
+        client.shutdown();
+    }
+
+    @Test
+    public void testClientTrackingBroadcast() throws InterruptedException, ExecutionException {
+        RedisPubSubConnection c = redisClient.connectPubSub();
+        c.sync((RedisCommands.CLIENT_TRACKING), "ON", "BCAST");
+        AtomicInteger counter = new AtomicInteger();
+        c.addListener(new RedisPubSubListener<String>() {
+            @Override
+            public void onMessage(CharSequence channel, String msg) {
+                counter.incrementAndGet();
+            }
+        });
+        c.subscribe(StringCodec.INSTANCE, new ChannelName("__redis__:invalidate")).get();
+        c.sync(RedisCommands.GET, "test");
+
+        RedisPubSubConnection c4 = redisClient.connectPubSub();
+        c4.sync((RedisCommands.CLIENT_TRACKING), "ON", "BCAST");
+        c4.addListener(new RedisPubSubListener<String>() {
+            @Override
+            public void onMessage(CharSequence channel, String msg) {
+                counter.incrementAndGet();
+            }
+        });
+        c4.subscribe(StringCodec.INSTANCE, new ChannelName("__redis__:invalidate")).get();
+        c4.sync(RedisCommands.GET, "test");
+
+        RedisConnection c3 = redisClient.connect();
+        c3.sync(RedisCommands.SET, "test", "1234");
+        Thread.sleep(500);
+        assertThat(counter.get()).isEqualTo(2);
+
+        counter.set(0);
+        c3.sync(RedisCommands.SET, "test", "1235");
+        Thread.sleep(500);
+        assertThat(counter.get()).isEqualTo(2);
+
+        counter.set(0);
+        c4.sync(RedisCommands.SET, "test", "1236");
+        Thread.sleep(500);
+        assertThat(counter.get()).isEqualTo(2);
+    }
+
+        @Test
+    public void testClientTracking() throws InterruptedException, ExecutionException {
+        RedisPubSubConnection c = redisClient.connectPubSub();
+        c.sync((RedisCommands.CLIENT_TRACKING), "ON");
+        AtomicInteger counter = new AtomicInteger();
+        c.addListener(new RedisPubSubListener<String>() {
+            @Override
+            public void onMessage(CharSequence channel, String msg) {
+                counter.incrementAndGet();
+            }
+        });
+        c.subscribe(StringCodec.INSTANCE, new ChannelName("__redis__:invalidate")).get();
+        c.sync(RedisCommands.GET, "test");
+
+        RedisPubSubConnection c4 = redisClient.connectPubSub();
+        c4.sync((RedisCommands.CLIENT_TRACKING), "ON");
+        c4.addListener(new RedisPubSubListener<String>() {
+            @Override
+            public void onMessage(CharSequence channel, String msg) {
+                counter.incrementAndGet();
+            }
+        });
+        c4.subscribe(StringCodec.INSTANCE, new ChannelName("__redis__:invalidate")).get();
+        c4.sync(RedisCommands.GET, "test");
+
+        RedisConnection c3 = redisClient.connect();
+        c3.sync(RedisCommands.SET, "test", "1234");
+        Thread.sleep(500);
+        assertThat(counter.get()).isEqualTo(2);
+
+        counter.set(0);
+        c.sync(RedisCommands.GET, "test");
+        c3.sync(RedisCommands.SET, "test", "1235");
+        Thread.sleep(500);
+        assertThat(counter.get()).isEqualTo(1);
+
+        counter.set(0);
+        c4.sync(RedisCommands.GET, "test");
+        c4.sync(RedisCommands.SET, "test", "1235");
+        Thread.sleep(500);
+        assertThat(counter.get()).isEqualTo(1);
+    }
+
+    @Test
+    public void testConnectAsync() throws InterruptedException, ExecutionException {
+        CompletionStage<RedisConnection> f = redisClient.connectAsync();
+        CountDownLatch l = new CountDownLatch(2);
+        f.whenComplete((conn, e) -> {
             assertThat(conn.sync(RedisCommands.PING)).isEqualTo("PONG");
             l.countDown();
+        });
+        f.handle((conn, ex) -> {
+            assertThat(conn.sync(RedisCommands.PING)).isEqualTo("PONG");
+            l.countDown();
+            return null; 
         });
         assertThat(l.await(10, TimeUnit.SECONDS)).isTrue();
     }
 
     @Test
     public void testSubscribe() throws InterruptedException {
-        RedisClient c = new RedisClient(RedisRunner.getDefaultRedisServerBindAddressAndPort());
-        RedisPubSubConnection pubSubConnection = c.connectPubSub();
+        RedisPubSubConnection pubSubConnection = redisClient.connectPubSub();
         final CountDownLatch latch = new CountDownLatch(2);
         pubSubConnection.addListener(new RedisPubSubListener<Object>() {
 
             @Override
-            public boolean onStatus(PubSubType type, String channel) {
+            public void onStatus(PubSubType type, CharSequence channel) {
                 assertThat(type).isEqualTo(PubSubType.SUBSCRIBE);
-                assertThat(Arrays.asList("test1", "test2").contains(channel)).isTrue();
+                assertThat(Arrays.asList("test1", "test2").contains(channel.toString())).isTrue();
                 latch.countDown();
-                return true;
             }
 
             @Override
-            public void onMessage(String channel, Object message) {
+            public void onMessage(CharSequence channel, Object message) {
             }
 
             @Override
-            public void onPatternMessage(String pattern, String channel, Object message) {
+            public void onPatternMessage(CharSequence pattern, CharSequence channel, Object message) {
             }
         });
-        pubSubConnection.subscribe(StringCodec.INSTANCE, "test1", "test2");
+        pubSubConnection.subscribe(StringCodec.INSTANCE, new ChannelName("test1"), new ChannelName("test2"));
 
         latch.await(10, TimeUnit.SECONDS);
     }
 
     @Test
     public void test() throws InterruptedException {
-        RedisClient c = new RedisClient(RedisRunner.getDefaultRedisServerInstance().getRedisServerBindAddress(),
-                RedisRunner.getDefaultRedisServerInstance().getRedisServerPort(),
-                1000000, 1000000);
-        final RedisConnection conn = c.connect();
+        final RedisConnection conn = redisClient.connect();
 
         conn.sync(StringCodec.INSTANCE, RedisCommands.SET, "test", 0);
         ExecutorService pool = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() * 2);
@@ -131,8 +204,7 @@ public class RedisClientTest {
 
     @Test
     public void testPipeline() throws InterruptedException, ExecutionException {
-        RedisClient c = new RedisClient(RedisRunner.getDefaultRedisServerBindAddressAndPort());
-        RedisConnection conn = c.connect();
+        RedisConnection conn = redisClient.connect();
 
         conn.sync(StringCodec.INSTANCE, RedisCommands.SET, "test", 0);
 
@@ -146,8 +218,8 @@ public class RedisClientTest {
         CommandData<String, String> cmd4 = conn.create(null, RedisCommands.PING);
         commands.add(cmd4);
 
-        RPromise<Void> p = new RedissonPromise<Void>();
-        conn.send(new CommandsData(p, commands));
+        CompletableFuture<Void> p = new CompletableFuture<Void>();
+        conn.send(new CommandsData(p, commands, false, false));
 
         assertThat(cmd1.getPromise().get()).isEqualTo("PONG");
         assertThat(cmd2.getPromise().get()).isEqualTo(1);
@@ -159,8 +231,7 @@ public class RedisClientTest {
 
     @Test
     public void testBigRequest() throws InterruptedException, ExecutionException {
-        RedisClient c = new RedisClient(RedisRunner.getDefaultRedisServerBindAddressAndPort());
-        RedisConnection conn = c.connect();
+        RedisConnection conn = redisClient.connect();
 
         for (int i = 0; i < 50; i++) {
             conn.sync(StringCodec.INSTANCE, RedisCommands.HSET, "testmap", i, "2");
@@ -174,8 +245,7 @@ public class RedisClientTest {
 
     @Test
     public void testPipelineBigResponse() throws InterruptedException, ExecutionException {
-        RedisClient c = new RedisClient(RedisRunner.getDefaultRedisServerBindAddressAndPort());
-        RedisConnection conn = c.connect();
+        RedisConnection conn = redisClient.connect();
 
         List<CommandData<?, ?>> commands = new ArrayList<CommandData<?, ?>>();
         for (int i = 0; i < 1000; i++) {
@@ -183,8 +253,8 @@ public class RedisClientTest {
             commands.add(cmd1);
         }
 
-        RPromise<Void> p = new RedissonPromise<Void>();
-        conn.send(new CommandsData(p, commands));
+        CompletableFuture<Void> p = new CompletableFuture<Void>();
+        conn.send(new CommandsData(p, commands, false, false));
 
         for (CommandData<?, ?> commandData : commands) {
             commandData.getPromise().get();

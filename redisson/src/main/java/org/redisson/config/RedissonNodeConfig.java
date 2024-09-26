@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,23 +15,18 @@
  */
 package org.redisson.config;
 
-import java.io.File;
-import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
-
-import org.redisson.api.RedissonNodeInitializer;
+import org.springframework.beans.factory.BeanFactory;
 
 /**
+ * Redisson Node configuration
  * 
  * @author Nikita Koksharov
  *
  */
-public class RedissonNodeConfig extends Config {
+public class RedissonNodeConfig extends RedissonNodeFileConfig {
     
-    private RedissonNodeInitializer redissonNodeInitializer;
-    private Map<String, Integer> executorServiceWorkers = new HashMap<String, Integer>();
-    
+    private BeanFactory beanFactory;
+
     public RedissonNodeConfig() {
         super();
     }
@@ -42,61 +37,21 @@ public class RedissonNodeConfig extends Config {
     
     public RedissonNodeConfig(RedissonNodeConfig oldConf) {
         super(oldConf);
-        this.executorServiceWorkers = new HashMap<String, Integer>(oldConf.executorServiceWorkers);
-        this.redissonNodeInitializer = oldConf.redissonNodeInitializer;
+        this.beanFactory = oldConf.beanFactory;
     }
     
+    public BeanFactory getBeanFactory() {
+        return beanFactory;
+    }
+
     /**
-     * Executor service workers amount per service name 
+     * Defines Spring Bean Factory instance to execute tasks with Spring's '@Autowired', 
+     * '@Value' or JSR-330's '@Inject' annotation.
      * 
-     * @param workers mapping
-     * @return config
+     * @param beanFactory - Spring BeanFactory instance
      */
-    public RedissonNodeConfig setExecutorServiceWorkers(Map<String, Integer> workers) {
-        this.executorServiceWorkers = workers;
-        return this;
-    }
-    public Map<String, Integer> getExecutorServiceWorkers() {
-        return executorServiceWorkers;
-    }
-    
-    public RedissonNodeInitializer getRedissonNodeInitializer() {
-        return redissonNodeInitializer;
+    public void setBeanFactory(BeanFactory beanFactory) {
+        this.beanFactory = beanFactory;
     }
 
-    /**
-     * Redisson node initializer
-     * 
-     * @param redissonNodeInitializer object
-     * @return config
-     */
-    public RedissonNodeConfig setRedissonNodeInitializer(RedissonNodeInitializer redissonNodeInitializer) {
-        this.redissonNodeInitializer = redissonNodeInitializer;
-        return this;
-    }
-
-    /**
-     * Read config object stored in JSON format from <code>File</code>
-     *
-     * @param file object
-     * @return config
-     * @throws IOException error
-     */
-    public static RedissonNodeConfig fromJSON(File file) throws IOException {
-        ConfigSupport support = new ConfigSupport();
-        return support.fromJSON(file, RedissonNodeConfig.class);
-    }
-
-    /**
-     * Read config object stored in YAML format from <code>File</code>
-     *
-     * @param file object
-     * @return config
-     * @throws IOException error
-     */
-    public static RedissonNodeConfig fromYAML(File file) throws IOException {
-        ConfigSupport support = new ConfigSupport();
-        return support.fromYAML(file, RedissonNodeConfig.class);
-    }
-    
 }

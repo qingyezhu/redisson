@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,35 +15,59 @@
  */
 package org.redisson.client.protocol.decoder;
 
-import java.util.LinkedHashMap;
+import org.redisson.client.codec.Codec;
+import org.redisson.client.handler.State;
+import org.redisson.client.protocol.Decoder;
+
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
-import org.redisson.client.handler.State;
+/**
+ * 
+ * @author Nikita Koksharov
+ *
+ */
+public class ObjectMapReplayDecoder<K, V> implements MultiDecoder<Map<K, V>> {
 
-import io.netty.buffer.ByteBuf;
+    private boolean swapKeyValue;
+    private final Codec codec;
 
-public class ObjectMapReplayDecoder implements MultiDecoder<Map<Object, Object>> {
+    public ObjectMapReplayDecoder(Codec codec) {
+        this.codec = codec;
+    }
 
-    @Override
-    public Object decode(ByteBuf buf, State state) {
-        throw new UnsupportedOperationException();
+    public ObjectMapReplayDecoder() {
+        this(null);
+    }
+
+    public ObjectMapReplayDecoder(boolean swapKeyValue, Codec codec) {
+        this.swapKeyValue = swapKeyValue;
+        this.codec = codec;
     }
 
     @Override
-    public Map<Object, Object> decode(List<Object> parts, State state) {
-        Map<Object, Object> result = new LinkedHashMap<Object, Object>(parts.size()/2);
+    public Decoder<Object> getDecoder(Codec codec, int paramNum, State state, long size) {
+        Codec c = Optional.ofNullable(this.codec).orElse(codec);
+        if (paramNum % 2 != 0) {
+            return c.getMapValueDecoder();
+        }
+        return c.getMapKeyDecoder();
+    }
+
+    @Override
+    public Map<K, V> decode(List<Object> parts, State state) {
+        Map<K, V> result = MultiDecoder.newLinkedHashMap(parts.size()/2);
         for (int i = 0; i < parts.size(); i++) {
             if (i % 2 != 0) {
-                result.put(parts.get(i-1), parts.get(i));
-           }
+                if (swapKeyValue) {
+                    result.put((K) parts.get(i), (V) parts.get(i-1));
+                } else {
+                    result.put((K) parts.get(i-1), (V) parts.get(i));
+                }
+            }
         }
         return result;
-    }
-
-    @Override
-    public boolean isApplicable(int paramNum, State state) {
-        return false;
     }
 
 }

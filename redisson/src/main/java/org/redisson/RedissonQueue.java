@@ -1,5 +1,5 @@
 /**
- * Copyright 2016 Nikita Koksharov
+ * Copyright (c) 2013-2024 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,13 +15,16 @@
  */
 package org.redisson;
 
-import java.util.NoSuchElementException;
-
 import org.redisson.api.RFuture;
 import org.redisson.api.RQueue;
+import org.redisson.api.RedissonClient;
 import org.redisson.client.codec.Codec;
 import org.redisson.client.protocol.RedisCommands;
 import org.redisson.command.CommandAsyncExecutor;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.NoSuchElementException;
 
 /**
  * Distributed and concurrent implementation of {@link java.util.Queue}
@@ -30,14 +33,14 @@ import org.redisson.command.CommandAsyncExecutor;
  *
  * @param <V> the type of elements held in this collection
  */
-public class RedissonQueue<V> extends RedissonList<V> implements RQueue<V> {
+public class RedissonQueue<V> extends BaseRedissonList<V> implements RQueue<V> {
 
-    protected RedissonQueue(CommandAsyncExecutor commandExecutor, String name) {
-        super(commandExecutor, name);
+    public RedissonQueue(CommandAsyncExecutor commandExecutor, String name, RedissonClient redisson) {
+        super(commandExecutor, name, redisson);
     }
 
-    protected RedissonQueue(Codec codec, CommandAsyncExecutor commandExecutor, String name) {
-        super(codec, commandExecutor, name);
+    public RedissonQueue(Codec codec, CommandAsyncExecutor commandExecutor, String name, RedissonClient redisson) {
+        super(codec, commandExecutor, name, redisson);
     }
 
     @Override
@@ -65,7 +68,7 @@ public class RedissonQueue<V> extends RedissonList<V> implements RQueue<V> {
         }
         return value;
     }
-
+    
     @Override
     public V remove() {
         return removeFirst();
@@ -73,7 +76,28 @@ public class RedissonQueue<V> extends RedissonList<V> implements RQueue<V> {
 
     @Override
     public RFuture<V> pollAsync() {
-        return commandExecutor.writeAsync(getName(), codec, RedisCommands.LPOP, getName());
+        return commandExecutor.writeAsync(getRawName(), codec, RedisCommands.LPOP, getRawName());
+    }
+
+    @Override
+    public List<V> poll(int limit) {
+        return get(pollAsync(limit));
+    }
+
+    @Override
+    public RFuture<List<V>> pollAsync(int limit) {
+        return commandExecutor.evalWriteNoRetryAsync(getRawName(), codec, RedisCommands.EVAL_LIST,
+                   "local result = {};"
+                 + "for i = 1, ARGV[1], 1 do " +
+                       "local value = redis.call('lpop', KEYS[1]);" +
+                       "if value ~= false then " +
+                           "table.insert(result, value);" +
+                       "else " +
+                           "return result;" +
+                       "end;" +
+                   "end; " +
+                   "return result;",
+                Collections.singletonList(getRawName()), limit);
     }
 
     @Override
@@ -103,12 +127,7 @@ public class RedissonQueue<V> extends RedissonList<V> implements RQueue<V> {
 
     @Override
     public RFuture<V> pollLastAndOfferFirstToAsync(String queueName) {
-        return commandExecutor.writeAsync(getName(), codec, RedisCommands.RPOPLPUSH, getName(), queueName);
-    }
-
-    @Override
-    public V pollLastAndOfferFirstTo(RQueue<V> queue) {
-        return pollLastAndOfferFirstTo(queue.getName());
+        return commandExecutor.writeAsync(getRawName(), codec, RedisCommands.RPOPLPUSH, getRawName(), queueName);
     }
 
 }
